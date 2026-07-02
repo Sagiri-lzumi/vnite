@@ -82,6 +82,15 @@ export function Sidebar(): React.JSX.Element {
           </TooltipTrigger>
           <TooltipContent side="right">{t('navigation.scanner')}</TooltipContent>
         </Tooltip>
+        {/* Cloud Archive */}
+        <Tooltip>
+          <TooltipTrigger>
+            <Nav variant="sidebar" to="/cloud" className="size-9 p-0">
+              <span className={cn('icon-[mdi--cloud-outline] w-5 h-5')}></span>
+            </Nav>
+          </TooltipTrigger>
+          <TooltipContent side="right">{t('navigation.cloudArchive')}</TooltipContent>
+        </Tooltip>
         {/* Transformer */}
         <Tooltip>
           <TooltipTrigger>

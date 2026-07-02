@@ -9,7 +9,17 @@ import { PosterRenderArgs, RenderResponse, TemplatePayloads } from '@appTypes/po
 import { BatchUpdateGameMetadataProgress, OverallScanProgress } from '@appTypes/utils'
 import { ProgressInfo, UpdateCheckResult } from 'electron-updater'
 import type { GameMediaType } from './models'
-import { BatchGameInfo, configDocs, configLocalDocs, gameDoc, GameTimerStatus } from './models'
+import {
+  BatchGameInfo,
+  CloudDatesheetStatusReport,
+  CloudGameSummary,
+  CloudStorageRole,
+  CloudTaskProgress,
+  configDocs,
+  configLocalDocs,
+  gameDoc,
+  GameTimerStatus
+} from './models'
 import { GameDatabaseStorageDetail, LocalDatabaseStorageReport } from './models/databaseInspector'
 import {
   PluginConfiguration,
@@ -191,8 +201,29 @@ type MainIpcEvents =
       ) => Record<string, { heightRatio: number }>
       'game:upscale-background': (gameId: string) => void
 
+      // Cloud game archive events
+      'cloud:get-config': () => configLocalDocs['game']['cloudStorage']
+      'cloud:update-config': (
+        config: Partial<configLocalDocs['game']['cloudStorage']> & { initializeDatesheet?: boolean }
+      ) => configLocalDocs['game']['cloudStorage']
+      'cloud:get-datesheet-status': () => CloudDatesheetStatusReport
+      'cloud:restore-datesheet-backup': (role: CloudStorageRole) => CloudDatesheetStatusReport
+      'cloud:cleanup-datesheet-lock': (role: CloudStorageRole) => CloudDatesheetStatusReport
+      'cloud:get-games': () => CloudGameSummary[]
+      'cloud:import-existing-games': () => { taskIds: string[] }
+      'cloud:import-game-to-cloud': (gameId: string) => { taskId: string }
+      'cloud:migrate-game-to-cloud': (gameId: string) => { taskId: string }
+      'cloud:download-game-to-local': (gameId: string) => { taskId: string }
+      'cloud:rebuild-archive': (gameId: string) => { taskId: string }
+      'cloud:get-task-progress': (query?: {
+        gameId?: string
+        taskId?: string
+      }) => CloudTaskProgress[]
+      'cloud:cancel-task': (query: { gameId?: string; taskId?: string }) => boolean
+
       // Game management events
       'game:check-exits-by-path': (gamePath: string) => boolean
+      'game:check-exists-by-metadata-id': (dataSource: string, dataSourceId: string) => boolean
       'game:delete': (gameId: string) => void
       'game:calculate-storage-size': (gameId: string) => number
       'game:recalculate-last-run-date': (gameId: string) => string
@@ -226,7 +257,7 @@ type MainIpcEvents =
         upscaleOptionsOverride?: GameImageUpscaleOptions
         dirPath?: string
         gamePath?: string
-      }) => void
+      }) => string
       'adder:update-game-metadata': (data: {
         dbId: string
         dataSource: string
@@ -238,7 +269,7 @@ type MainIpcEvents =
         options?: GameMetadataUpdateOptions
       }) => void
       'adder:get-batch-game-adder-data': () => BatchGameInfo[]
-      'adder:add-game-to-db-without-metadata': (dirPath: string, gamePath: string) => void
+      'adder:add-game-to-db-without-metadata': (dirPath: string, gamePath: string) => string
       'adder:batch-update-game-metadata': (data: {
         gameIds: string[]
         dataSource: string
@@ -417,7 +448,7 @@ type RendererIpcEvents = {
   'game:exiting': [gameId: string]
   'game:exited': [gameId: string]
   'game:start-from-url': [gameId: string]
-  'game:launch-failed': [gameId: string]
+  'game:launch-failed': [gameId: string, reason?: 'cloud' | 'syncing']
 
   'importer:import-steam-games-progress': [
     {
@@ -457,6 +488,10 @@ type RendererIpcEvents = {
       error?: string
     }
   ]
+
+  'cloud:task-progress': [progress: CloudTaskProgress]
+  'cloud:task-completed': [progress: CloudTaskProgress]
+  'cloud:task-failed': [progress: CloudTaskProgress]
 
   'plugin:update-all-plugins': [plugins: Omit<PluginInfo, 'instance'>[]]
   'plugin:update-plugin-stats': [stats: PluginStatsData]

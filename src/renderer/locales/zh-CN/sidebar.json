@@ -6,7 +6,8 @@
     "scanner": "扫描器",
     "databaseInspector": "数据库检查器",
     "transformer": "转换器",
-    "plugin": "插件"
+    "plugin": "插件",
+    "cloudArchive": "云归档"
   },
   "actions": {
     "viewLogs": "查看日志",

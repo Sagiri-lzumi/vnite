@@ -123,6 +123,13 @@ export function setupGameIPC(): void {
     return await GameDBManager.checkGameExitsByPath(gamePath)
   })
 
+  ipcManager.handle(
+    'game:check-exists-by-metadata-id',
+    async (_, dataSource: string, dataSourceId: string) => {
+      return await GameDBManager.checkGameExistsByMetadataId(dataSource, dataSourceId)
+    }
+  )
+
   ipcManager.handle('game:calculate-storage-size', async (_, gameId: string) => {
     return await calculateStorageSize(gameId)
   })

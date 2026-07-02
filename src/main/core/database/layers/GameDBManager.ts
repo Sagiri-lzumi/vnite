@@ -237,6 +237,39 @@ export class GameDBManager {
     }
   }
 
+  static async checkGameExistsByMetadataId(
+    dataSource: string,
+    dataSourceId: string
+  ): Promise<boolean> {
+    try {
+      const gameId = await this.findExistingGameIdByMetadataId(dataSource, dataSourceId)
+      return gameId !== null
+    } catch (error) {
+      log.error('[GameDB] Error checking game existence by metadata ID:', error)
+      throw error
+    }
+  }
+
+  static async findExistingGameIdByMetadataId(
+    dataSource: string,
+    dataSourceId: string
+  ): Promise<string | null> {
+    try {
+      if (!dataSource || !dataSourceId) return null
+      const metadataKey = `${dataSource}Id`
+      const games = await this.getAllGames()
+      const game = Object.values(games).find((item) => {
+        if (!item?._id || item._id === 'collections') return false
+        const metadata = item.metadata as Record<string, unknown>
+        return metadata[metadataKey] === dataSourceId
+      })
+      return game?._id || null
+    } catch (error) {
+      log.error('[GameDB] Error finding existing game ID by metadata ID:', error)
+      throw error
+    }
+  }
+
   static async findExistingGameIdByPath(inputPath: string): Promise<string | null> {
     try {
       const games = await this.getAllGamesLocal()

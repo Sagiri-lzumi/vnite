@@ -2,6 +2,123 @@ import { Paths } from 'type-fest'
 
 export type GameMediaType = 'cover' | 'background' | 'icon' | 'logo' | 'wideCover'
 
+export type CloudGameStatus = 'local' | 'cloud' | 'syncing' | 'error'
+
+export type CloudTaskPhase =
+  | 'copying'
+  | 'compressing'
+  | 'deleting'
+  | 'downloading'
+  | 'extracting'
+  | 'completed'
+  | 'error'
+
+export type CloudStorageRole = 'localCache' | 'cloudArchive'
+
+export interface CloudTaskProgress {
+  taskId: string
+  gameId: string
+  gameName: string
+  phase: CloudTaskPhase
+  percent: number
+  processedBytes: number
+  totalBytes: number
+  speedBytesPerSecond: number
+  etaSeconds: number | null
+  message: string
+  errorCode?: string
+  startedAt: string
+  updatedAt: string
+}
+
+export interface CloudDatesheetGameEntry {
+  gameId: string
+  gameName: string
+  status: CloudGameStatus
+  localManagedPath: string
+  archiveDir: string
+  archiveParts: string[]
+  sizeBytes: number
+  fileCount: number
+  fileNames: string[]
+  fileListHash: string
+  archiveRevision: string
+  localRevision: string
+  lastVerifiedAt: string
+  lastError: string
+}
+
+export interface CloudDatesheet {
+  schemaVersion: 1
+  pairId: string
+  role: CloudStorageRole
+  createdAt: string
+  updatedAt: string
+  lastOperationId: string
+  games: Record<string, CloudDatesheetGameEntry>
+}
+
+
+export type CloudDatesheetReadStatus =
+  | 'ok'
+  | 'missing'
+  | 'corrupted'
+  | 'unrecoverable'
+  | 'recoveredFromBackup'
+  | 'schemaUnsupported'
+  | 'roleMismatch'
+  | 'pairMismatch'
+  | 'pathEmpty'
+  | 'lockBusy'
+  | 'lockTimeout'
+
+export interface CloudDatesheetLockInfo {
+  exists: boolean
+  expired: boolean
+  operationId: string
+  pid: number
+  createdAt: string
+  ageMs: number
+  error: string
+}
+
+export interface CloudDatesheetSideStatus {
+  role: CloudStorageRole
+  root: string
+  filePath: string
+  status: CloudDatesheetReadStatus
+  exists: boolean
+  recoveredFromBackup: boolean
+  pairId: string
+  pairIdShort: string
+  schemaVersion: number
+  gameCount: number
+  updatedAt: string
+  hasRootContent: boolean
+  canRestoreFromBackup: boolean
+  lock: CloudDatesheetLockInfo
+  error: string
+}
+
+export interface CloudDatesheetStatusReport {
+  enabled: boolean
+  pairMatched: boolean
+  canInitialize: boolean
+  local: CloudDatesheetSideStatus
+  cloud: CloudDatesheetSideStatus
+}
+export interface CloudGameSummary {
+  gameId: string
+  gameName: string
+  status: CloudGameStatus
+  localManagedPath: string
+  archiveDir: string
+  archiveParts: string[]
+  sizeBytes: number
+  updatedAt: string
+  lastError: string
+}
+
 export type gameDocs = {
   [gameId: string]: gameDoc
 }
@@ -141,6 +258,16 @@ export interface gameLocalDoc {
     markPath: string
     rootPath: string
   }
+  cloud: {
+    status: CloudGameStatus
+    archiveDir: string
+    archiveParts: string[]
+    localManagedPath: string
+    originalImportedPath: string
+    sizeBytes: number
+    updatedAt: string
+    lastError: string
+  }
 }
 
 export const DEFAULT_GAME_LOCAL_VALUES: Readonly<gameLocalDoc> = {
@@ -175,6 +302,16 @@ export const DEFAULT_GAME_LOCAL_VALUES: Readonly<gameLocalDoc> = {
   utils: {
     markPath: '',
     rootPath: ''
+  },
+  cloud: {
+    status: 'local',
+    archiveDir: '',
+    archiveParts: [],
+    localManagedPath: '',
+    originalImportedPath: '',
+    sizeBytes: 0,
+    updatedAt: '',
+    lastError: ''
   }
 } as const
 

@@ -6,7 +6,6 @@ import { join } from 'path'
 import { baseDBManager, GameDBManager, runDatabaseMigrations } from '~/core/database'
 import { startSync } from '~/features/database'
 import {
-  getAppRootPath,
   getDataPath,
   getLogsPath,
   setupScreenshotService,
@@ -52,9 +51,33 @@ export function isGamesLoaded(): boolean {
   return gamesLoaded
 }
 
+let devLogsPath = ''
+if (!app.isPackaged) {
+  const devUserDataPath = join(app.getAppPath(), 'dev')
+  devLogsPath = join(devUserDataPath, 'logs')
+  app.setPath('userData', devUserDataPath)
+  app.setAppLogsPath(devLogsPath)
+  log.transports.file.resolvePathFn = (): string => join(devLogsPath, 'app.log')
+}
+
 log.initialize()
 
 global.fetch = net.fetch as typeof global.fetch
+
+const disableHardwareAcceleration = ['1', 'true', 'yes'].includes(
+  String(process.env.VNITE_DISABLE_HARDWARE_ACCELERATION || '').toLowerCase()
+)
+if (disableHardwareAcceleration) {
+  app.disableHardwareAcceleration()
+  app.commandLine.appendSwitch('disable-gpu')
+  app.commandLine.appendSwitch('disable-gpu-compositing')
+  app.commandLine.appendSwitch('disable-gpu-sandbox')
+  app.commandLine.appendSwitch('disable-software-rasterizer')
+  app.commandLine.appendSwitch('disable-accelerated-2d-canvas')
+  app.commandLine.appendSwitch('disable-accelerated-video-decode')
+  app.commandLine.appendSwitch('disable-features', 'UseSkiaRenderer,VizDisplayCompositor')
+  app.commandLine.appendSwitch('in-process-gpu')
+}
 
 let launchGameId: string | null = null
 const args = process.argv
@@ -179,11 +202,6 @@ app.whenReady().then(async () => {
 
   // IPC test
   ipcMain.on('ping', () => console.log('pong'))
-
-  // Set the userData directory to a different location in development
-  if (!app.isPackaged) {
-    app.setPath('userData', join(getAppRootPath(), 'dev'))
-  }
 
   log.transports.file.resolvePathFn = (): string => getLogsPath()
 

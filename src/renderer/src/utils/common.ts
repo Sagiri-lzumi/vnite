@@ -1,3 +1,4 @@
+import type { CloudTaskProgress } from '@appTypes/models'
 import { generateUUID } from '@appUtils'
 import { NavigateFn } from '@tanstack/react-router'
 import { Element, HTMLReactParserOptions } from 'html-react-parser'
@@ -154,6 +155,28 @@ export function stopGame(gameId: string): void {
   )
 }
 
+async function waitForCloudTask(startPromise: Promise<{ taskId: string }>): Promise<void> {
+  const { taskId } = await startPromise
+  await new Promise<void>((resolve, reject) => {
+    let offCompleted: (() => void) | undefined
+    let offFailed: (() => void) | undefined
+    const cleanup = (): void => {
+      offCompleted?.()
+      offFailed?.()
+    }
+    offCompleted = ipcManager.on('cloud:task-completed', (_event, progress: CloudTaskProgress) => {
+      if (progress.taskId !== taskId) return
+      cleanup()
+      resolve()
+    })
+    offFailed = ipcManager.on('cloud:task-failed', (_event, progress: CloudTaskProgress) => {
+      if (progress.taskId !== taskId) return
+      cleanup()
+      reject(new Error(progress.message))
+    })
+  })
+}
+
 /**
  * Logic for starting the game
  */
@@ -179,6 +202,30 @@ export async function startGame(
   const getGameLocalValue = gameLocalStore.getState().getValue
   const setGameValue = gameStore.getState().setValue
   const getGameValue = gameStore.getState().getValue
+
+  const cloudStatus = getGameLocalValue('cloud.status')
+  if (cloudStatus === 'cloud') {
+    toast.warning(i18next.t('cloudArchive:notifications.downloadBeforeStart'), {
+      action: {
+        label: i18next.t('cloudArchive:actions.download'),
+        onClick: () => {
+          toast.promise(waitForCloudTask(ipcManager.invoke('cloud:download-game-to-local', gameId)), {
+            loading: i18next.t('cloudArchive:notifications.downloadingToLocal'),
+            success: i18next.t('cloudArchive:notifications.downloadToLocalSuccess'),
+            error: (error) => i18next.t('cloudArchive:notifications.taskFailed', {
+              label: i18next.t('cloudArchive:actions.download'),
+              message: error.message
+            })
+          })
+        }
+      }
+    })
+    return
+  }
+  if (cloudStatus === 'syncing') {
+    toast.warning(i18next.t('cloudArchive:notifications.waitForSyncing'))
+    return
+  }
 
   const gamePath = getGameLocalValue('path.gamePath')
   const gamePathExists = (await ipcManager.invoke('system:check-if-path-exist', [gamePath]))[0]

@@ -287,6 +287,16 @@ export interface configLocalDocs {
     captureFullscreen: string
   }
   game: {
+    cloudStorage: {
+      enabled: boolean
+      cloudRoot: string
+      localRoot: string
+      localLimitBytes: number
+      archiveFormat: '7z'
+      volumeSizeBytes: number
+      sevenZipPath: string
+      autoImportNewGames: boolean
+    }
     linkage: {
       localeEmulator: {
         path: string
@@ -561,6 +571,16 @@ export const DEFAULT_CONFIG_LOCAL_VALUES: Readonly<configLocalDocs> = {
     captureFullscreen: ''
   },
   game: {
+    cloudStorage: {
+      enabled: false,
+      cloudRoot: '',
+      localRoot: '',
+      localLimitBytes: 0,
+      archiveFormat: '7z',
+      volumeSizeBytes: 2 * 1024 * 1024 * 1024,
+      sevenZipPath: '',
+      autoImportNewGames: false
+    },
     linkage: {
       localeEmulator: {
         path: ''

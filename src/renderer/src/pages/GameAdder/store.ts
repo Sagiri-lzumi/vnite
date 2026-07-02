@@ -14,6 +14,11 @@ export type GameList = {
 
 export type GameAdderPage = 'search' | 'games' | 'backgrounds'
 
+export interface PendingCloudAutoImport {
+  gameId: string
+  gameName: string
+}
+
 interface GameAdderState {
   isOpen: boolean
   setIsOpen: (isOpen: boolean) => void
@@ -41,6 +46,8 @@ interface GameAdderState {
   setDirPath: (dirPath: string) => void
   gamePath: string
   setGamePath: (gamePath: string) => void
+  pendingCloudAutoImport: PendingCloudAutoImport | null
+  setPendingCloudAutoImport: (pending: PendingCloudAutoImport | null) => void
   handleClose: () => void
 }
 
@@ -71,6 +78,8 @@ export const useGameAdderStore = create<GameAdderState>((set, get) => ({
   setDirPath: (dirPath): void => set({ dirPath }),
   gamePath: '',
   setGamePath: (gamePath): void => set({ gamePath }),
+  pendingCloudAutoImport: null,
+  setPendingCloudAutoImport: (pending): void => set({ pendingCloudAutoImport: pending }),
   handleClose: (): void => {
     const {
       isLoading,

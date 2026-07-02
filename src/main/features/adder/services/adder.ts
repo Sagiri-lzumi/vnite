@@ -465,7 +465,7 @@ export async function addGameToDB({
 export async function addGameToDBWithoutMetadata(
   dirPath: string,
   gamePath?: string
-): Promise<void> {
+): Promise<string> {
   try {
     const dbId = generateUUID()
     // Get the game name from the path
@@ -508,6 +508,8 @@ export async function addGameToDBWithoutMetadata(
       },
       { source: 'adder' }
     )
+
+    return dbId
   } catch (error) {
     log.error('[Adder] Failed to add game to database without metadata:', error)
     throw error

@@ -13,7 +13,7 @@ import { useGameBatchEditorStore } from '~/components/GameBatchEditor/store'
 import { useDragContext } from '~/components/Showcase/CollectionGames'
 import { ContextMenu, ContextMenuTrigger } from '~/components/ui/context-menu'
 import { GameImage } from '~/components/ui/game-image'
-import { useConfigState, useGameState } from '~/hooks'
+import { useConfigState, useGameLocalState, useGameState } from '~/hooks'
 import { useRunningGames } from '~/pages/Library/store'
 import { useGameCollectionStore, useGameRegistry } from '~/stores/game'
 import { cn, navigateToGame } from '~/utils'
@@ -98,6 +98,7 @@ export function GamePoster({
   const [dragging, setDragging] = useState<boolean>(false)
   const [previewState, setPreviewState] = useState<PreviewState>({ type: 'idle' })
   const [showPlayButtonOnPoster] = useConfigState('appearances.showcase.showPlayButtonOnPoster')
+  const [cloudStatus] = useGameLocalState(gameId, 'cloud.status')
 
   const name = gameData?.name ?? ''
   const stringToBase64 = (str: string): string =>
@@ -250,12 +251,14 @@ export function GamePoster({
               alt={gameId}
               className={cn(
                 'w-[148px] aspect-[2/3] cursor-pointer select-none object-cover rounded-lg',
+                cloudStatus === 'cloud' && 'grayscale opacity-60',
                 className
               )}
               fallback={
                 <div
                   className={cn(
                     'w-[148px] aspect-[2/3] cursor-pointer object-cover flex items-center justify-center bg-muted/50',
+                    cloudStatus === 'cloud' && 'grayscale opacity-60',
                     className
                   )}
                   onClick={() => navigateToGame(navigate, gameId, groupId || 'all')}
@@ -265,6 +268,12 @@ export function GamePoster({
               }
             />
           </HoverCardAnimation>
+
+          {cloudStatus === 'cloud' && (
+            <div className="absolute left-2 top-2 z-20 flex h-6 w-6 items-center justify-center rounded-full bg-background/80 text-muted-foreground shadow-sm">
+              <span className="icon-[mdi--cloud-outline] h-4 w-4" />
+            </div>
+          )}
 
           {/* Hover overlay */}
           <div
@@ -326,7 +335,10 @@ export function GamePoster({
           </div>
         </div>
 
-        <div className="text-xs text-foreground truncate cursor-pointer select-none hover:underline w-[148px] text-center decoration-foreground">
+        <div className="text-xs text-foreground truncate cursor-pointer select-none hover:underline w-[148px] text-center decoration-foreground flex items-center justify-center gap-1">
+          {cloudStatus === 'cloud' && (
+            <span className="icon-[mdi--cloud-outline] h-3 w-3 flex-shrink-0 text-muted-foreground" />
+          )}
           {nsfw && nsfwBlurLevel >= NSFWBlurLevel.BlurImageAndTitle ? (
             <>
               <span className="block group-hover:hidden truncate">{obfuscatedName}</span>

@@ -32,13 +32,14 @@ export function GameNav({
   const [playStatus] = useGameState(gameId, 'record.playStatus')
   const [storageSize] = useGameState(gameId, 'record.storageSize')
   const [gamePath] = useGameLocalState(gameId, 'path.gamePath')
+  const [cloudStatus] = useGameLocalState(gameId, 'cloud.status')
   const isPathValid = useGamePathStore((s) => s.paths[gamePath]?.valid)
 
   useEffect(() => {
-    if (gamePath) {
+    if (gamePath && cloudStatus !== 'cloud') {
       useGamePathStore.getState().requestValidity(gamePath)
     }
-  }, [gamePath])
+  }, [gamePath, cloudStatus])
 
   const [highlightLocalGames] = useConfigState('game.gameList.highlightLocalGames')
   const [gameNavStyle] = useConfigState('game.gameList.gameNavStyle')
@@ -187,9 +188,17 @@ export function GameNav({
               gameId={gameId}
               type="icon"
               alt="icon"
-              className={cn('w-[18px] h-[18px] rounded-md object-cover bg-accent shadow-sm')}
+              className={cn(
+                'w-[18px] h-[18px] rounded-md object-cover bg-accent shadow-sm',
+                cloudStatus === 'cloud' && 'grayscale opacity-60'
+              )}
               fallback={
-                <span className={cn('icon-[mdi--gamepad-variant] w-[18px] h-[18px]')}></span>
+                <span
+                  className={cn(
+                    'icon-[mdi--gamepad-variant] w-[18px] h-[18px]',
+                    cloudStatus === 'cloud' && 'grayscale opacity-60'
+                  )}
+                ></span>
               }
             />
           </div>
@@ -199,7 +208,16 @@ export function GameNav({
 
       case 'gameName': {
         navLayout.push(
-          <div key={`${gameId}-name`} className={cn('relative flex-1 min-w-0')}>
+          <div key={`${gameId}-name`} className={cn('relative flex flex-1 min-w-0 items-center gap-1')}>
+            {cloudStatus === 'cloud' && (
+              <span className="icon-[mdi--cloud-outline] w-[13px] h-[13px] flex-shrink-0 text-muted-foreground" />
+            )}
+            {cloudStatus === 'syncing' && (
+              <span className="icon-[mdi--sync] w-[13px] h-[13px] flex-shrink-0 animate-spin text-muted-foreground" />
+            )}
+            {cloudStatus === 'error' && (
+              <span className="icon-[mdi--alert-circle-outline] w-[13px] h-[13px] flex-shrink-0 text-destructive" />
+            )}
             <span ref={nameDisplayRef} className={cn('block truncate')}>
               {nsfw && nsfwBlurLevel >= NSFWBlurLevel.BlurImageAndTitle
                 ? obfuscatedGameName
@@ -267,7 +285,14 @@ export function GameNav({
       }
 
       case 'localFlag': {
-        if (gamePath && isPathValid) {
+        if (cloudStatus === 'cloud') {
+          navLayout.push(
+            <span
+              key={`${gameId}-local-flag-cloud`}
+              className="icon-[mdi--cloud-outline] w-[10px] h-[10px] text-muted-foreground flex-shrink-0"
+            />
+          )
+        } else if (gamePath && isPathValid) {
           navLayout.push(
             <span
               key={`${gameId}-local-flag-valid`}
@@ -326,8 +351,9 @@ export function GameNav({
               className={cn(
                 'text-xs p-3 h-5 rounded-none transition-none w-full',
                 highlightLocalGames && 'text-foreground',
-                highlightLocalGames && gamePath && isPathValid && 'text-accent-foreground',
+                highlightLocalGames && gamePath && isPathValid && cloudStatus !== 'cloud' && 'text-accent-foreground',
                 highlightLocalGames && !gamePath && !isDarkMode && 'text-foreground',
+                cloudStatus === 'cloud' && 'text-muted-foreground',
                 isSelected && 'bg-accent/[calc(var(--glass-opacity)*2)]'
               )}
               to="/library/games/$gameId/$groupId"

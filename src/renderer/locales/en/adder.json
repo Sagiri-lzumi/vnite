@@ -65,6 +65,26 @@
         "ymgal": "YMGal",
         "dlsite": "DLsite"
       }
+    },
+    "cloudAutoImport": {
+      "title": "Add this game to Cloud Archive?",
+      "description": "Vnite will move the files for {{gameName}} into the local cache directory and generate cloud 7z volumes. The original import location will not be deleted. Large games can take a while and use local cache and cloud archive space.",
+      "actions": {
+        "importToCloud": "Add to Cloud Archive",
+        "normalImport": "Normal Import Only"
+      },
+      "notifications": {
+        "starting": "Adding {{gameName}} to Cloud Archive...",
+        "success": "{{gameName}} has been added to Cloud Archive. The local cache is playable and the cloud archive is ready.",
+        "failed": "Failed to add {{gameName}} to Cloud Archive: {{message}}. The game was imported normally and can be retried later.",
+        "skipped": "Imported normally. You can add it to Cloud Archive later from the context menu or Cloud Archive page."
+      },
+      "errors": {
+        "spaceInsufficient": "Local cache space is not enough, so Cloud Archive import was skipped. The game was imported normally; clear space and add it to Cloud Archive manually later.",
+        "sevenZipUnavailable": "No usable 7-Zip was found, so the cloud archive could not be generated. The game was imported normally; install 7-Zip or set a 7z path in Cloud Archive settings and retry later.",
+        "cloudConfigInvalid": "Cloud Archive directory validation failed, so automatic Cloud Archive import was canceled. The game remains normally imported; check Cloud Archive settings and retry manually later.",
+        "taskCanceled": "Automatic Cloud Archive import was canceled. The game was imported normally and can be retried later."
+      }
     }
   },
   "gameBatchAdder": {

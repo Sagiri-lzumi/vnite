@@ -11,6 +11,7 @@ import { Showcase } from '~/components/Showcase'
 import { CollectionGames } from '~/components/Showcase/CollectionGames'
 import { CollectionPage } from '~/components/Showcase/CollectionPage'
 import { RouteContentErrorFallback } from '~/components/errors/RouteContentErrorFallback'
+import { CloudArchive, CloudArchiveSettings } from '~/pages/CloudArchive'
 import { Config } from '~/pages/Config'
 import { DatabaseInspector, DatabaseInspectorGameDetail } from '~/pages/DatabaseInspector'
 import { GameScannerManager } from '~/pages/GameScannerManager'
@@ -32,7 +33,7 @@ const ABSOLUTE_ISO_DATE_REGEX =
  *
  * Record search contract:
  * - `date` is the real query timestamp (no business-day boundary alignment in router).
- * - `date` input must include explicit timezone (`Z` or `±HH:mm`) and is canonicalized to UTC ISO.
+ * - `date` input must include explicit timezone (`Z` or `+/-HH:mm`) and is canonicalized to UTC ISO.
  * - `year` is a business-year label (boundary-aware at yearly granularity).
  *   Router derives it from `date` only when `year` is missing.
  */
@@ -166,6 +167,20 @@ const configRoute = createRoute({
   errorComponent: RouteContentErrorFallback
 })
 
+const cloudRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/cloud',
+  component: CloudArchive,
+  errorComponent: RouteContentErrorFallback
+})
+
+const cloudSettingsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/cloud/settings',
+  component: CloudArchiveSettings,
+  errorComponent: RouteContentErrorFallback
+})
+
 const scannerRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/scanner',
@@ -229,6 +244,8 @@ const routeTree = rootRoute.addChildren([
   ]),
   recordRoute,
   configRoute,
+  cloudRoute,
+  cloudSettingsRoute,
   scannerRoute,
   databaseInspectorRoute,
   databaseInspectorGameRoute,

@@ -17,6 +17,7 @@ import {
 import { cn } from '~/utils'
 import { GameList, useGameAdderStore } from './store'
 import { useGameLocalState } from '~/hooks'
+import { requestCloudAutoImportPrompt, shouldPromptCloudAutoImportForPath } from './cloudAutoImport'
 
 export function Search({ className }: { className?: string }): React.JSX.Element {
   const { t } = useTranslation('adder')
@@ -151,7 +152,19 @@ export function Search({ className }: { className?: string }): React.JSX.Element
     }
     toast.promise(
       (async (): Promise<void> => {
-        await ipcManager.invoke('adder:add-game-to-db-without-metadata', dirPath, gamePath)
+        const shouldPromptCloudAutoImport = await shouldPromptCloudAutoImportForPath(
+          dirPath,
+          gamePath,
+          undefined,
+          undefined,
+          dbId
+        )
+        const gameId = await ipcManager.invoke(
+          'adder:add-game-to-db-without-metadata',
+          dirPath,
+          gamePath
+        )
+        if (shouldPromptCloudAutoImport) await requestCloudAutoImportPrompt(gameId)
         handleClose()
       })(),
       {

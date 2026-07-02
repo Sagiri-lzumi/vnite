@@ -36,7 +36,7 @@ export function setupAdderIPC(): void {
         gamePath?: string
       }
     ) => {
-      await addGameToDB({
+      return await addGameToDB({
         dataSource,
         dataSourceId,
         backgroundUrl,
@@ -92,7 +92,7 @@ export function setupAdderIPC(): void {
   ipcManager.handle(
     'adder:add-game-to-db-without-metadata',
     async (_, dirPath: string, gamePath: string) => {
-      await addGameToDBWithoutMetadata(dirPath, gamePath)
+      return await addGameToDBWithoutMetadata(dirPath, gamePath)
     }
   )
 

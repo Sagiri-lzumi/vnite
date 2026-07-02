@@ -6,7 +6,8 @@
     "scanner": "Scanner",
     "databaseInspector": "Database Inspector",
     "transformer": "Transformer",
-    "plugin": "Plugins"
+    "plugin": "Plugins",
+    "cloudArchive": "Cloud Archive"
   },
   "actions": {
     "viewLogs": "View Logs",

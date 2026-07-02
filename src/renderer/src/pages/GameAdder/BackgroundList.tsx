@@ -7,6 +7,7 @@ import { UpscaleConfigControl } from '~/components/utils/UpscaleConfigControl'
 import { cn } from '~/utils'
 import { useGameMetadataUpdaterStore } from '../GameMetadataUpdater/store'
 import { useGameAdderStore } from './store'
+import { requestCloudAutoImportPrompt, shouldPromptCloudAutoImportForPath } from './cloudAutoImport'
 
 export function BackgroundList(): React.JSX.Element {
   const { t } = useTranslation(['adder', 'game'])
@@ -120,7 +121,14 @@ export function BackgroundList(): React.JSX.Element {
         toast.loading(t('gameAdder.backgrounds.notifications.adding'), {
           id: 'adding-game'
         })
-        await ipcManager.invoke('adder:add-game-to-db', {
+        const shouldPromptCloudAutoImport = await shouldPromptCloudAutoImportForPath(
+          dirPath,
+          gamePath,
+          dataSource,
+          dataSourceId,
+          dbId
+        )
+        const gameId = await ipcManager.invoke('adder:add-game-to-db', {
           dataSource,
           dataSourceId,
           backgroundUrl,
@@ -128,6 +136,7 @@ export function BackgroundList(): React.JSX.Element {
           dirPath,
           gamePath
         })
+        if (shouldPromptCloudAutoImport) await requestCloudAutoImportPrompt(gameId)
         setIsAdding(false)
         handleClose()
         toast.success(t('gameAdder.backgrounds.notifications.addSuccess'), {

@@ -1,4 +1,4 @@
-import { DEFAULT_PLAY_STATUS_ORDER } from '@appTypes/models'
+import { DEFAULT_PLAY_STATUS_ORDER, type CloudTaskProgress } from '@appTypes/models'
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
@@ -21,6 +21,7 @@ import { Dialog, DialogContent } from '~/components/ui/dialog'
 import { Input } from '~/components/ui/input'
 import { useConfigState, useGameLocalState, useGameState } from '~/hooks'
 import { useGameAdderStore } from '~/pages/GameAdder/store'
+import { useRunningGames } from '~/pages/Library/store'
 import { cn, formatStorageSize } from '~/utils'
 
 export function ManageMenu({
@@ -34,6 +35,8 @@ export function ManageMenu({
 }): React.JSX.Element {
   const [gamePath] = useGameLocalState(gameId, 'path.gamePath')
   const [rootPath] = useGameLocalState(gameId, 'utils.rootPath')
+  const [cloudStatus] = useGameLocalState(gameId, 'cloud.status')
+  const [archiveDir] = useGameLocalState(gameId, 'cloud.archiveDir')
   const [gameName] = useGameState(gameId, 'metadata.name')
   const [nsfw, setNsfw] = useGameState(gameId, 'apperance.nsfw')
   const [playStatus, setPlayStatus] = useGameState(gameId, 'record.playStatus')
@@ -47,6 +50,53 @@ export function ManageMenu({
   const setName = useGameAdderStore((state) => state.setName)
   const setDbId = useGameAdderStore((state) => state.setDbId)
   const { t } = useTranslation('game')
+  const { t: tCloud } = useTranslation('cloudArchive')
+  const { runningGames } = useRunningGames()
+  const isCloudTaskDisabled = cloudStatus === 'syncing' || runningGames.includes(gameId)
+  const cloudTaskDisabledReason = cloudStatus === 'syncing'
+    ? tCloud('notifications.waitForSyncing')
+    : runningGames.includes(gameId)
+      ? tCloud('notifications.gameRunning')
+      : undefined
+
+  const waitForCloudTask = async (startPromise: Promise<{ taskId: string }>): Promise<void> => {
+    const { taskId } = await startPromise
+    await new Promise<void>((resolve, reject) => {
+      let offCompleted: (() => void) | undefined
+      let offFailed: (() => void) | undefined
+      const cleanup = (): void => {
+        offCompleted?.()
+        offFailed?.()
+      }
+      offCompleted = ipcManager.on('cloud:task-completed', (_event, progress: CloudTaskProgress) => {
+        if (progress.taskId !== taskId) return
+        cleanup()
+        resolve()
+      })
+      offFailed = ipcManager.on('cloud:task-failed', (_event, progress: CloudTaskProgress) => {
+        if (progress.taskId !== taskId) return
+        cleanup()
+        reject(new Error(progress.message))
+      })
+    })
+    refreshGameList()
+  }
+
+  const startCloudTask = (messages: { loading: string; success: string }, promise: Promise<{ taskId: string }>): void => {
+    toast.promise(waitForCloudTask(promise), {
+      loading: messages.loading,
+      success: messages.success,
+      error: (error) => tCloud('notifications.taskFailed', { label: messages.loading, message: error.message })
+    })
+  }
+
+  const openArchiveDir = (): void => {
+    if (!archiveDir) {
+      toast.warning(tCloud('notifications.archivePathMissing'))
+      return
+    }
+    void ipcManager.invoke('system:open-path-in-explorer', archiveDir)
+  }
 
   const resetPreScore = (): void => setPreScore(score === -1 ? '' : score.toString())
 
@@ -196,6 +246,60 @@ export function ManageMenu({
               >
                 {t('detail.manage.browseLocalFiles')}
               </ContextMenuItem>
+
+              <ContextMenuSeparator />
+
+              {cloudStatus === 'cloud' ? (
+                <ContextMenuItem
+                  disabled={isCloudTaskDisabled}
+                  title={cloudTaskDisabledReason}
+                  onClick={() =>
+                    startCloudTask(
+                      {
+                        loading: tCloud('notifications.downloadingToLocal'),
+                        success: tCloud('notifications.downloadToLocalSuccess')
+                      },
+                      ipcManager.invoke('cloud:download-game-to-local', gameId)
+                    )
+                  }
+                >
+                  {tCloud('actions.download')}
+                </ContextMenuItem>
+              ) : (
+                <ContextMenuItem
+                  disabled={isCloudTaskDisabled}
+                  title={cloudTaskDisabledReason}
+                  onClick={() =>
+                    startCloudTask(
+                      {
+                        loading: tCloud('notifications.migratingToCloud'),
+                        success: tCloud('notifications.migrateToCloudSuccess')
+                      },
+                      ipcManager.invoke('cloud:migrate-game-to-cloud', gameId)
+                    )
+                  }
+                >
+                  {tCloud('actions.migrate')}
+                </ContextMenuItem>
+              )}
+              <ContextMenuItem onClick={openArchiveDir}>{tCloud('actions.openArchive')}</ContextMenuItem>
+              {cloudStatus !== 'cloud' && (
+                <ContextMenuItem
+                  disabled={isCloudTaskDisabled}
+                  title={cloudTaskDisabledReason}
+                  onClick={() =>
+                    startCloudTask(
+                      {
+                        loading: tCloud('notifications.rebuildingArchive'),
+                        success: tCloud('notifications.rebuildArchiveSuccess')
+                      },
+                      ipcManager.invoke('cloud:rebuild-archive', gameId)
+                    )
+                  }
+                >
+                  {tCloud('actions.rebuild')}
+                </ContextMenuItem>
+              )}
               {/* Calculate Storage Size */}
               {rootPath && (
                 <ContextMenuItem

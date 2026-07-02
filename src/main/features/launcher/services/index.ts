@@ -33,6 +33,13 @@ export async function launcherPreset(
 
 export async function launcher(gameId: string): Promise<void> {
   try {
+    const cloudStatus = await GameDBManager.getGameLocalValue(gameId, 'cloud.status')
+    if (cloudStatus === 'cloud' || cloudStatus === 'syncing') {
+      ipcManager.send('game:launch-failed', gameId, cloudStatus)
+      log.warn(`[Launcher] Refused to launch cloud-managed game ${gameId} with status ${cloudStatus}`)
+      return
+    }
+
     const mode = await GameDBManager.getGameLocalValue(gameId, 'launcher.mode')
     const mainWindow = BrowserWindow.getAllWindows()[0]
     const hideWindowAfterGameStart = await ConfigDBManager.getConfigValue(

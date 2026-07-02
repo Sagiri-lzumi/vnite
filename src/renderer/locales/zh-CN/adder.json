@@ -65,6 +65,26 @@
         "ymgal": "YMGal",
         "dlsite": "DLsite"
       }
+    },
+    "cloudAutoImport": {
+      "title": "是否将该游戏纳入云归档？",
+      "description": "开启后，Vnite 会把《{{gameName}}》的游戏文件转入本地缓存目录，并生成云端 7z 分卷归档。原始导入位置不会被 Vnite 自动删除。大游戏可能需要较长时间，并占用本地缓存和云端归档空间。",
+      "actions": {
+        "importToCloud": "纳入云归档",
+        "normalImport": "仅普通导入"
+      },
+      "notifications": {
+        "starting": "正在将《{{gameName}}》纳入云归档...",
+        "success": "《{{gameName}}》已纳入云归档。本地缓存可直接游玩，云端归档已生成。",
+        "failed": "《{{gameName}}》自动纳入云归档失败：{{message}}。游戏已按普通方式导入，可之后手动重试。",
+        "skipped": "已按普通方式导入。之后可在右键菜单或云归档页面手动纳入云管理。"
+      },
+      "errors": {
+        "spaceInsufficient": "本地缓存空间不足，无法自动纳入云归档。游戏已按普通方式导入，你可以清理空间后手动纳入云管理。",
+        "sevenZipUnavailable": "未找到可用的 7-Zip，无法生成云端归档。游戏已按普通方式导入，请安装 7-Zip 或在云归档设置中填写 7z 路径后重试。",
+        "cloudConfigInvalid": "云归档目录校验失败，已取消自动纳入。游戏仍按普通方式保留，请检查云归档设置后手动重试。",
+        "taskCanceled": "自动纳入云归档已取消。游戏已按普通方式导入，可之后手动重试。"
+      }
     }
   },
   "gameBatchAdder": {

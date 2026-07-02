@@ -35,6 +35,22 @@ export function setupCloudSyncListener(): () => void {
   return ipcManager.on('db:sync-status', handleSyncStatus)
 }
 
+export function setupCloudArchiveTaskListener(): () => void {
+  const { refreshGameList } = useLibrarybarStore.getState()
+
+  const completedListener = ipcManager.on('cloud:task-completed', () => {
+    refreshGameList()
+  })
+  const failedListener = ipcManager.on('cloud:task-failed', () => {
+    refreshGameList()
+  })
+
+  return () => {
+    completedListener()
+    failedListener()
+  }
+}
+
 export function setupGameStartListeners(): () => void {
   const { refreshGameList } = useLibrarybarStore.getState()
 
@@ -76,27 +92,41 @@ export function setupGameStartListeners(): () => void {
 export function setupGameLaunchFailedListeners(): () => void {
   const { refreshGameList } = useLibrarybarStore.getState()
 
-  const failedListener = ipcManager.on('game:launch-failed', (_, gameId: string) => {
-    const { runningGames, setRunningGames } = useRunningGames.getState()
-    if (!runningGames.includes(gameId)) {
-      return
+  const failedListener = ipcManager.on(
+    'game:launch-failed',
+    (_, gameId: string, reason?: 'cloud' | 'syncing') => {
+      const { runningGames, setRunningGames } = useRunningGames.getState()
+      const wasRunning = runningGames.includes(gameId)
+
+      if (wasRunning) {
+        const newRunningGames = runningGames.filter((elem) => elem !== gameId)
+        // Update the list of running games
+        setRunningGames(newRunningGames)
+
+        // Refresh the game list
+        refreshGameList()
+      }
+
+      if (reason === 'cloud') {
+        toast.warning(i18next.t('cloudArchive:notifications.downloadBeforeStart'), {
+          id: `${gameId}-launch-failed`
+        })
+      } else if (reason === 'syncing') {
+        toast.warning(i18next.t('cloudArchive:notifications.waitForSyncing'), {
+          id: `${gameId}-launch-failed`
+        })
+      } else if (wasRunning) {
+        toast.info(i18next.t('utils:notifications.gameLaunchFailed'), {
+          id: `${gameId}-launch-failed`
+        })
+      }
+
+      // Turn off notifications after 4 seconds
+      setTimeout(() => {
+        toast.dismiss(`${gameId}-launch-failed`)
+      }, 4000)
     }
-    const newRunningGames = runningGames.filter((elem) => elem !== gameId)
-    // Update the list of running games
-    setRunningGames(newRunningGames)
-
-    // Refresh the game list
-    refreshGameList()
-
-    toast.info(i18next.t('utils:notifications.gameLaunchFailed'), {
-      id: `${gameId}-launch-failed`
-    })
-
-    // Turn off notifications after 4 seconds
-    setTimeout(() => {
-      toast.dismiss(`${gameId}-launch-failed`)
-    }, 4000)
-  })
+  )
 
   return () => {
     failedListener()
@@ -202,6 +232,7 @@ export async function setup(router: any): Promise<() => void> {
   const cleanupFunctions = [
     setupGameUrlListener(router),
     setupCloudSyncListener(),
+    setupCloudArchiveTaskListener(),
     setupGameStartListeners(),
     setupGameLaunchFailedListeners(),
     setupGameExitListeners(),

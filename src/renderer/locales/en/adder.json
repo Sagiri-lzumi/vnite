@@ -50,7 +50,8 @@
         "recognized": "Game recognized successfully",
         "invalidId": "Invalid ID",
         "recognizeError": "Failed to recognize game: {{message}}",
-        "selectGamePath": "Please select game path",
+        "selectGamePath": "Please select the game root directory",
+        "gamePathOutsideRoot": "The startup file must be inside the game root directory",
         "adding": "Adding game…",
         "addSuccess": "Successfully added game",
         "addError": "Error adding game"

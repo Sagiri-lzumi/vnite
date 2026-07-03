@@ -13,6 +13,8 @@ import {
   BatchGameInfo,
   CloudDatesheetStatusReport,
   CloudGameSummary,
+  CloudOrphanSummary,
+  CloudStorageLocationInfo,
   CloudStorageRole,
   CloudTaskProgress,
   configDocs,
@@ -204,12 +206,19 @@ type MainIpcEvents =
       // Cloud game archive events
       'cloud:get-config': () => configLocalDocs['game']['cloudStorage']
       'cloud:update-config': (
-        config: Partial<configLocalDocs['game']['cloudStorage']> & { initializeDatesheet?: boolean }
+        config: Partial<configLocalDocs['game']['cloudStorage']>
       ) => configLocalDocs['game']['cloudStorage']
+      'cloud:initialize-datesheets': (
+        config?: Partial<configLocalDocs['game']['cloudStorage']>
+      ) => CloudDatesheetStatusReport
       'cloud:get-datesheet-status': () => CloudDatesheetStatusReport
       'cloud:restore-datesheet-backup': (role: CloudStorageRole) => CloudDatesheetStatusReport
       'cloud:cleanup-datesheet-lock': (role: CloudStorageRole) => CloudDatesheetStatusReport
       'cloud:get-games': () => CloudGameSummary[]
+      'cloud:get-orphans': () => CloudOrphanSummary[]
+      'cloud:get-storage-location': () => CloudStorageLocationInfo
+      'cloud:restore-local-orphan': (gameId: string) => string
+      'cloud:archive-local-orphan': (gameId: string) => { taskId: string }
       'cloud:import-existing-games': () => { taskIds: string[] }
       'cloud:import-game-to-cloud': (gameId: string) => { taskId: string }
       'cloud:migrate-game-to-cloud': (gameId: string) => { taskId: string }

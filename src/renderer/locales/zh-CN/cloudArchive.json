@@ -10,6 +10,7 @@
     "cloud": "云端 {{count}}",
     "syncing": "同步中 {{count}}",
     "error": "错误 {{count}}",
+    "orphans": "异常 {{count}}",
     "localBytes": "本地缓存 {{size}}"
   },
   "actions": {
@@ -21,13 +22,17 @@
     "download": "下载到本地",
     "rebuild": "重建归档",
     "openArchive": "打开归档",
+    "openLocal": "打开本地",
     "settings": "归档设置",
     "back": "返回",
     "recheck": "重新校验",
     "restoreBackup": "恢复备份",
     "cleanupLock": "清理锁",
     "confirm": "确认",
-    "initializeDatesheet": "初始化 datesheet"
+    "initializeDatesheet": "初始化 Datesheet",
+    "switchToPortable": "迁移到项目目录",
+    "restoreOrphan": "恢复游戏",
+    "archiveOrphan": "上传到云端"
   },
   "config": {
     "title": "归档配置",
@@ -38,19 +43,43 @@
     "volumeSize": "7z 分卷大小（GB）",
     "sevenZipPath": "自定义 7z 路径",
     "summaryTitle": "归档位置",
-    "summaryDescription": "云端目录和本地缓存目录在设置子界面中管理。",
+    "summaryDescription": "云端目录和本地缓存目录在设置子页面中管理。",
     "settingsDescription": "在这里设置云端归档位置、本地缓存位置、容量上限、分卷大小和 7z 路径。",
     "notSet": "未设置",
     "unlimited": "不限制",
     "localLimitShort": "本地缓存上限",
     "volumeSizeShort": "7z 分卷大小",
-    "autoImportNewGames": "新导入游戏后自动纳入云归档",
+    "autoImportNewGames": "新导入游戏后自动提示纳入云归档",
     "autoImportNewGamesDescription": "开启后，通过主页导入的新游戏会在导入完成后提示纳入云归档。大游戏可能需要较长时间，并会占用本地缓存空间和云端目录空间。"
+  },
+  "storage": {
+    "title": "配置保存位置",
+    "description": "显示云归档设置当前实际保存在哪里。",
+    "configPath": "配置数据库",
+    "databaseRoot": "数据库根目录",
+    "appRoot": "程序根目录",
+    "portable": "项目目录模式",
+    "normal": "用户数据模式",
+    "notPortableWarning": "云归档设置当前保存在用户数据数据库中。如果希望设置跟着这个项目/程序目录走，请迁移到项目目录模式。"
   },
   "tasks": {
     "title": "任务进度",
     "running": "{{count}} 个运行中",
     "empty": "暂无云归档任务"
+  },
+  "orphans": {
+    "title": "未纳入 / 异常文件",
+    "count": "{{count}} 项",
+    "empty": "没有发现未纳入的缓存或归档文件。",
+    "kind": {
+      "localOnly": "仅本地",
+      "cloudOnly": "仅云端",
+      "datesheetOnly": "仅 Datesheet",
+      "dbMissingFiles": "文件缺失"
+    },
+    "loading": "正在扫描未纳入的缓存和归档目录...",
+    "loadFailed": "扫描未纳入文件失败：{{message}}",
+    "sizeUnknown": "大小未知"
   },
   "games": {
     "title": "游戏归档状态",
@@ -66,7 +95,11 @@
     "error": "错误"
   },
   "phases": {
+    "queued": "排队中",
+    "scanning": "扫描中",
     "copying": "复制中",
+    "verifying": "校验中",
+    "writingDatesheet": "写入 Datesheet",
     "compressing": "压缩中",
     "deleting": "删除中",
     "downloading": "下载中",
@@ -81,12 +114,13 @@
     "taskStarting": "正在启动{{label}}...",
     "taskStarted": "{{label}}已启动",
     "taskFailed": "{{label}}失败：{{message}}",
+    "openPathFailed": "打开路径失败：{{message}}",
     "downloadBeforeStart": "这个游戏当前在云端归档中，请先下载到本地缓存后再启动。",
     "waitForSyncing": "这个游戏正在执行云归档任务，请等待任务完成。",
     "archivePathMissing": "这个游戏还没有云端归档路径。",
-    "restoringDatesheet": "正在恢复 datesheet 备份...",
-    "restoreDatesheetSuccess": "datesheet 备份已恢复",
-    "restoreDatesheetFailed": "恢复 datesheet 备份失败：{{message}}",
+    "restoringDatesheet": "正在恢复 Datesheet 备份...",
+    "restoreDatesheetSuccess": "Datesheet 备份已恢复",
+    "restoreDatesheetFailed": "恢复 Datesheet 备份失败：{{message}}",
     "cleaningLock": "正在清理过期锁...",
     "cleanLockSuccess": "过期锁已清理",
     "cleanLockFailed": "清理锁失败：{{message}}",
@@ -96,7 +130,18 @@
     "downloadingToLocal": "正在下载到本地...",
     "downloadToLocalSuccess": "已下载到本地",
     "rebuildingArchive": "正在重新生成云端归档...",
-    "rebuildArchiveSuccess": "云端归档已重新生成"
+    "rebuildArchiveSuccess": "云端归档已重新生成",
+    "portableAdminRequired": "迁移数据库到项目目录需要管理员权限。",
+    "switchingPortable": "正在迁移数据库到项目目录模式...",
+    "switchPortableSuccess": "数据库已迁移到项目目录模式",
+    "switchPortableFailed": "迁移数据库失败：{{message}}",
+    "restartCountdown": "Vnite 将在 3 秒后重启。",
+    "restoringOrphan": "正在恢复 {{name}}...",
+    "restoreOrphanSuccess": "{{name}} 已恢复",
+    "restoreOrphanFailed": "恢复游戏失败：{{message}}",
+    "initializeRequired": "请先初始化 Datesheet，再执行云归档任务。",
+    "initializeDatesheetSuccess": "Datesheet 已初始化",
+    "initializeDatesheetFailed": "初始化 Datesheet 失败：{{message}}"
   },
   "settingsTitle": "云归档设置",
   "datesheet": {
@@ -110,8 +155,8 @@
     "lockExpired": "过期锁",
     "lockBusy": "锁定中",
     "roles": {
-      "localCache": "本地缓存 datesheet",
-      "cloudArchive": "云端归档 datesheet"
+      "localCache": "本地缓存 Datesheet",
+      "cloudArchive": "云端归档 Datesheet"
     },
     "status": {
       "ok": "正常",
@@ -124,40 +169,44 @@
       "pathEmpty": "路径未设置",
       "lockBusy": "锁定中",
       "lockTimeout": "锁已过期",
-      "unrecoverable": "不可恢复"
+      "unrecoverable": "不可恢复",
+      "operationTimeout": "超时"
     },
-    "cleanupConfirmTitle": "清理过期 datesheet 锁？",
+    "cleanupConfirmTitle": "清理过期 Datesheet 锁？",
     "cleanupConfirmDescription": "只有在确认没有云归档任务正在运行时才清理。清理后可以重新保存配置或重试云归档操作。",
-    "nonEmptyMissing": "该目录已有内容但没有 Vnite datesheet，初始化前请确认这是要作为云归档使用的目录。",
-    "initializeConfirmTitle": "初始化 datesheet？",
-    "initializeConfirmDescription": "Vnite 将在本地缓存目录和云端归档目录写入配对的 datesheet 文件，用于识别这组云归档目录。",
-    "initializeNonEmptyConfirmDescription": "检测到至少一个目录已有内容但没有 Vnite datesheet。确认后只会写入 datesheet 标记文件，不会删除现有文件；请确认你选择的是正确的本地缓存目录和云端归档目录。"
+    "nonEmptyMissing": "该目录已有内容但没有 Vnite Datesheet，初始化前请确认这是要作为云归档使用的目录。",
+    "initializeConfirmTitle": "初始化 Datesheet？",
+    "initializeConfirmDescription": "Vnite 将在本地缓存目录和云端归档目录写入配对的 Datesheet 文件，用于识别这组云归档目录。",
+    "initializeNonEmptyConfirmDescription": "检测到至少一个目录已有内容但没有 Vnite Datesheet。确认后只会写入 Datesheet 标记文件，不会删除现有文件；请确认你选择的是正确的本地缓存目录和云端归档目录。"
   },
   "errors": {
-    "pathEmpty": "请先设置云端目录和本地缓存目录。",
+    "pathEmpty": "请先选择云端归档目录和本地缓存目录。",
     "pathNotWritable": "目录不可写：{{message}}",
     "sameRoot": "云端归档目录和本地缓存目录不能是同一个目录。",
-    "datesheetMissing": "datesheet 缺失，请保存设置进行初始化。",
-    "recoveredFromBackup": "正式 datesheet 已损坏，请先从备份恢复。",
-    "pairMismatch": "本地和云端 datesheet 不是同一组。",
-    "roleMismatch": "这个目录的 datesheet 角色不正确。",
-    "schemaUnsupported": "当前 Vnite 版本不支持这个 datesheet。",
-    "corrupted": "datesheet 已损坏：{{message}}",
-    "lockBusy": "datesheet 正被另一个操作锁定。",
-    "lockTimeout": "datesheet 存在过期锁。确认没有任务运行后再清理。",
-    "backupMissing": "datesheet 备份不存在。",
+    "datesheetMissing": "Datesheet 缺失，需要先初始化 Datesheet 后才能使用这组归档目录。",
+    "recoveredFromBackup": "正式 Datesheet 已损坏，请先从备份恢复。",
+    "pairMismatch": "本地和云端 Datesheet 不是同一组。",
+    "roleMismatch": "这个目录的 Datesheet 角色不正确。",
+    "schemaUnsupported": "当前 Vnite 版本不支持这个 Datesheet。",
+    "corrupted": "Datesheet 已损坏：{{message}}",
+    "lockBusy": "Datesheet 正被另一个操作锁定。",
+    "lockTimeout": "Datesheet 存在过期锁。确认没有任务运行后再清理。",
+    "backupMissing": "Datesheet 备份不存在。",
     "archivePartsMissing": "云端归档分卷缺失，云盘可能还没同步完成。",
-    "archivePartsMismatch": "云端归档分卷和 datesheet 不一致。",
+    "archivePartsMismatch": "云端归档分卷和 Datesheet 不一致。",
     "localLimitExceeded": "本地缓存容量上限不足。",
     "diskSpaceInsufficient": "磁盘剩余空间不足。",
     "sevenZipMissing": "未找到 7-Zip，请安装 7-Zip 或设置自定义路径。",
     "taskCanceled": "云归档任务已取消。",
+    "localPathMissing": "本地游戏目录不存在。",
+    "targetExists": "目标目录已经存在。",
     "invalidGameId": "这个游戏 ID 不能安全地用作云归档目录名。请先检查游戏数据或等待后续兼容迁移。",
     "unknown": "{{message}}",
-    "unrecoverable": "datesheet 不可恢复：{{message}}",
-    "schemaInvalid": "datesheet 结构无效：{{message}}",
-    "writeFailed": "写入 datesheet 失败：{{message}}",
-    "sevenZipInvalid": "自定义 7-Zip 路径无效，请重新选择 7z.exe 或清空该字段使用系统 7-Zip。"
+    "unrecoverable": "Datesheet 不可恢复：{{message}}",
+    "schemaInvalid": "Datesheet 结构无效：{{message}}",
+    "writeFailed": "写入 Datesheet 失败：{{message}}",
+    "sevenZipInvalid": "自定义 7-Zip 路径无效，请重新选择 7z.exe 或清空该字段使用系统 7-Zip。",
+    "operationTimeout": "云归档操作超时：{{message}}。可能是云盘目录无响应、仍在同步、数据库被旧进程占用，或存在未清理的过期锁；请检查目录后重试。",
+    "notEnabled": "请先启用云归档，再执行云归档任务。"
   }
 }
-

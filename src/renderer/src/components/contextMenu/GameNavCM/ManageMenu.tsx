@@ -1,4 +1,4 @@
-import { DEFAULT_PLAY_STATUS_ORDER, type CloudTaskProgress } from '@appTypes/models'
+import { DEFAULT_PLAY_STATUS_ORDER } from '@appTypes/models'
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
@@ -19,10 +19,10 @@ import {
 } from '~/components/ui/context-menu'
 import { Dialog, DialogContent } from '~/components/ui/dialog'
 import { Input } from '~/components/ui/input'
-import { useConfigState, useGameLocalState, useGameState } from '~/hooks'
+import { useConfigLocalState, useConfigState, useGameLocalState, useGameState } from '~/hooks'
 import { useGameAdderStore } from '~/pages/GameAdder/store'
 import { useRunningGames } from '~/pages/Library/store'
-import { cn, formatStorageSize } from '~/utils'
+import { cn, formatStorageSize, waitForCloudTask } from '~/utils'
 
 export function ManageMenu({
   gameId,
@@ -37,6 +37,8 @@ export function ManageMenu({
   const [rootPath] = useGameLocalState(gameId, 'utils.rootPath')
   const [cloudStatus] = useGameLocalState(gameId, 'cloud.status')
   const [archiveDir] = useGameLocalState(gameId, 'cloud.archiveDir')
+  const [archiveParts] = useGameLocalState(gameId, 'cloud.archiveParts')
+  const [cloudRoot] = useConfigLocalState('game.cloudStorage.cloudRoot')
   const [gameName] = useGameState(gameId, 'metadata.name')
   const [nsfw, setNsfw] = useGameState(gameId, 'apperance.nsfw')
   const [playStatus, setPlayStatus] = useGameState(gameId, 'record.playStatus')
@@ -53,49 +55,71 @@ export function ManageMenu({
   const { t: tCloud } = useTranslation('cloudArchive')
   const { runningGames } = useRunningGames()
   const isCloudTaskDisabled = cloudStatus === 'syncing' || runningGames.includes(gameId)
+  const canDownloadFromCloud =
+    cloudStatus === 'cloud' || (cloudStatus === 'error' && (Boolean(archiveDir) || archiveParts.length > 0))
   const cloudTaskDisabledReason = cloudStatus === 'syncing'
     ? tCloud('notifications.waitForSyncing')
     : runningGames.includes(gameId)
       ? tCloud('notifications.gameRunning')
       : undefined
 
-  const waitForCloudTask = async (startPromise: Promise<{ taskId: string }>): Promise<void> => {
-    const { taskId } = await startPromise
-    await new Promise<void>((resolve, reject) => {
-      let offCompleted: (() => void) | undefined
-      let offFailed: (() => void) | undefined
-      const cleanup = (): void => {
-        offCompleted?.()
-        offFailed?.()
-      }
-      offCompleted = ipcManager.on('cloud:task-completed', (_event, progress: CloudTaskProgress) => {
-        if (progress.taskId !== taskId) return
-        cleanup()
-        resolve()
-      })
-      offFailed = ipcManager.on('cloud:task-failed', (_event, progress: CloudTaskProgress) => {
-        if (progress.taskId !== taskId) return
-        cleanup()
-        reject(new Error(progress.message))
-      })
-    })
+  const refreshAfterCloudTask = async (promise: Promise<{ taskId: string }>): Promise<void> => {
+    await waitForCloudTask(promise)
     refreshGameList()
   }
 
   const startCloudTask = (messages: { loading: string; success: string }, promise: Promise<{ taskId: string }>): void => {
-    toast.promise(waitForCloudTask(promise), {
+    toast.promise(refreshAfterCloudTask(promise), {
       loading: messages.loading,
       success: messages.success,
       error: (error) => tCloud('notifications.taskFailed', { label: messages.loading, message: error.message })
     })
   }
 
-  const openArchiveDir = (): void => {
-    if (!archiveDir) {
+  const isAbsolutePathLike = (value: string): boolean =>
+    /^[A-Za-z]:[\\/]/.test(value) || value.startsWith('\\\\') || value.startsWith('/')
+
+  const joinRootPath = (root: string, child: string): string => {
+    if (!root) return child
+    if (!child) return root
+    if (isAbsolutePathLike(child)) return child
+    return `${root.replace(/[\\/]+$/, '')}\\${child.replace(/^[\\/]+/, '')}`
+  }
+
+  const withTimeout = async <T,>(promise: Promise<T>, timeoutMs: number): Promise<T> =>
+    await new Promise<T>((resolve, reject) => {
+      const timer = window.setTimeout(() => reject(new Error('Open path timed out')), timeoutMs)
+      promise.then(
+        (value) => {
+          window.clearTimeout(timer)
+          resolve(value)
+        },
+        (error) => {
+          window.clearTimeout(timer)
+          reject(error)
+        }
+      )
+    })
+
+  const openPath = async (target: string): Promise<void> => {
+    if (!target) {
       toast.warning(tCloud('notifications.archivePathMissing'))
       return
     }
-    void ipcManager.invoke('system:open-path-in-explorer', archiveDir)
+    try {
+      const [exists] = await withTimeout(ipcManager.invoke('system:check-if-path-exist', [target]), 10_000)
+      if (!exists) {
+        toast.error(tCloud('notifications.openPathFailed', { message: target }))
+        return
+      }
+      await withTimeout(ipcManager.invoke('system:open-path-in-explorer', target), 10_000)
+    } catch (error) {
+      toast.error(tCloud('notifications.openPathFailed', { message: error instanceof Error ? error.message : String(error) }))
+    }
+  }
+
+  const openArchiveDir = (): void => {
+    void openPath(joinRootPath(cloudRoot, archiveDir || gameId))
   }
 
   const resetPreScore = (): void => setPreScore(score === -1 ? '' : score.toString())
@@ -249,7 +273,7 @@ export function ManageMenu({
 
               <ContextMenuSeparator />
 
-              {cloudStatus === 'cloud' ? (
+              {canDownloadFromCloud ? (
                 <ContextMenuItem
                   disabled={isCloudTaskDisabled}
                   title={cloudTaskDisabledReason}
@@ -283,7 +307,7 @@ export function ManageMenu({
                 </ContextMenuItem>
               )}
               <ContextMenuItem onClick={openArchiveDir}>{tCloud('actions.openArchive')}</ContextMenuItem>
-              {cloudStatus !== 'cloud' && (
+              {!canDownloadFromCloud && (
                 <ContextMenuItem
                   disabled={isCloudTaskDisabled}
                   title={cloudTaskDisabledReason}

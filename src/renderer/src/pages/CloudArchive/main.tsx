@@ -4,6 +4,8 @@ import type {
   CloudDatesheetStatusReport,
   CloudGameStatus,
   CloudGameSummary,
+  CloudOrphanSummary,
+  CloudStorageLocationInfo,
   CloudStorageRole,
   CloudTaskProgress,
   configLocalDocs
@@ -42,7 +44,7 @@ import {
   Wrench,
   XCircle
 } from 'lucide-react'
-import React, { useCallback, useEffect, useMemo, useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 import { ipcManager } from '~/app/ipc'
@@ -60,6 +62,33 @@ const DEFAULT_CONFIG: CloudStorageConfig = {
   volumeSizeBytes: 2 * 1024 * 1024 * 1024,
   sevenZipPath: '',
   autoImportNewGames: false
+}
+
+const SAVE_CONFIG_TIMEOUT_MS = 20_000
+const ORPHAN_SCAN_TIMEOUT_MS = 15_000
+const INITIALIZE_DATESHEET_TIMEOUT_MS = 20_000
+const TASK_START_TIMEOUT_MS = 20_000
+const OPEN_PATH_TIMEOUT_MS = 10_000
+const LOAD_DATA_TIMEOUT_MS = 15_000
+
+function createCloudUiError(code: string, message: string): Error {
+  return new Error(`[${code}] ${message}`)
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, error: Error): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = window.setTimeout(() => reject(error), timeoutMs)
+    promise.then(
+      (value) => {
+        window.clearTimeout(timer)
+        resolve(value)
+      },
+      (reason) => {
+        window.clearTimeout(timer)
+        reject(reason)
+      }
+    )
+  })
 }
 
 function gbToBytes(value: number): number {
@@ -84,6 +113,17 @@ function formatEta(value: number | null): string {
   return minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`
 }
 
+function isAbsolutePathLike(value: string): boolean {
+  return /^[A-Za-z]:[\\/]/.test(value) || value.startsWith('\\\\') || value.startsWith('/')
+}
+
+function joinRootPath(root: string, child: string): string {
+  if (!root) return child
+  if (!child) return root
+  if (isAbsolutePathLike(child)) return child
+  return `${root.replace(/[\\/]+$/, '')}\\${child.replace(/^[\\/]+/, '')}`
+}
+
 function statusVariant(
   status: CloudGameStatus
 ): 'default' | 'outline' | 'secondary' | 'destructive' {
@@ -99,6 +139,12 @@ function statusVariant(
   }
 }
 
+function hasDownloadableArchive(game: CloudGameSummary): boolean {
+  return (
+    game.status === 'cloud' ||
+    (game.status === 'error' && (Boolean(game.archiveDir) || game.archiveParts.length > 0))
+  )
+}
 function datesheetStatusVariant(
   status: CloudDatesheetSideStatus['status']
 ): 'default' | 'outline' | 'secondary' | 'destructive' {
@@ -129,12 +175,19 @@ function CloudArchiveView({ mode }: { mode: CloudArchiveViewMode }): React.JSX.E
   const [config, setConfig] = useState<CloudStorageConfig>(DEFAULT_CONFIG)
   const [form, setForm] = useState<CloudStorageConfig>(DEFAULT_CONFIG)
   const [games, setGames] = useState<CloudGameSummary[]>([])
+  const [orphans, setOrphans] = useState<CloudOrphanSummary[]>([])
+  const [storageLocation, setStorageLocation] = useState<CloudStorageLocationInfo | null>(null)
   const [tasks, setTasks] = useState<Record<string, CloudTaskProgress>>({})
   const [datesheetStatus, setDatesheetStatus] = useState<CloudDatesheetStatusReport | null>(null)
   const [lockCleanupRole, setLockCleanupRole] = useState<CloudStorageRole | null>(null)
   const [initializeDatesheetOpen, setInitializeDatesheetOpen] = useState(false)
   const [isLoading, setIsLoading] = useState(true)
   const [isSaving, setIsSaving] = useState(false)
+  const [isInitializingDatesheet, setIsInitializingDatesheet] = useState(false)
+  const [isOrphansLoading, setIsOrphansLoading] = useState(false)
+  const [orphanLoadError, setOrphanLoadError] = useState('')
+  const saveRequestIdRef = useRef(0)
+  const orphanLoadRequestIdRef = useRef(0)
 
   const activeTasks = useMemo(
     () =>
@@ -165,20 +218,83 @@ function CloudArchiveView({ mode }: { mode: CloudArchiveViewMode }): React.JSX.E
   const initializeDatesheetHasContent = Boolean(
     datesheetStatus?.local.hasRootContent || datesheetStatus?.cloud.hasRootContent
   )
+  const datesheetsPaired = Boolean(
+    datesheetStatus?.local.status === 'ok' &&
+      datesheetStatus.cloud.status === 'ok' &&
+      datesheetStatus.pairMatched
+  )
+  const datesheetRootsChanged =
+    form.localRoot !== config.localRoot || form.cloudRoot !== config.cloudRoot
+  const canInitializeDatesheets = Boolean(
+    form.localRoot && form.cloudRoot && (!datesheetsPaired || datesheetRootsChanged)
+  )
+  const datesheetReady = Boolean(config.enabled && datesheetsPaired)
+
+  const formatCloudError = useCallback(
+    (error: unknown): string => {
+      const { code, message } = parseCloudError(error)
+      return t(`errors.${code}`, { message, defaultValue: message })
+    },
+    [t]
+  )
+
+  const loadOrphans = useCallback(async (): Promise<void> => {
+    const requestId = ++orphanLoadRequestIdRef.current
+    setIsOrphansLoading(true)
+    setOrphanLoadError('')
+    try {
+      const nextOrphans = await withTimeout(
+        ipcManager.invoke('cloud:get-orphans'),
+        ORPHAN_SCAN_TIMEOUT_MS,
+        createCloudUiError('operationTimeout', 'Cloud orphan scan timed out')
+      )
+      if (requestId === orphanLoadRequestIdRef.current) setOrphans(nextOrphans)
+    } catch (error) {
+      if (requestId === orphanLoadRequestIdRef.current) {
+        setOrphanLoadError(formatCloudError(error))
+      }
+    } finally {
+      if (requestId === orphanLoadRequestIdRef.current) setIsOrphansLoading(false)
+    }
+  }, [formatCloudError])
 
   const loadData = useCallback(async (): Promise<void> => {
-    const [nextConfig, nextGames, nextTasks, nextDatesheetStatus] = await Promise.all([
-      ipcManager.invoke('cloud:get-config'),
-      ipcManager.invoke('cloud:get-games'),
-      ipcManager.invoke('cloud:get-task-progress'),
-      ipcManager.invoke('cloud:get-datesheet-status')
-    ])
+    const [nextConfig, nextGames, nextTasks, nextDatesheetStatus, nextStorageLocation] =
+      await Promise.all([
+        withTimeout(
+          ipcManager.invoke('cloud:get-config'),
+          LOAD_DATA_TIMEOUT_MS,
+          createCloudUiError('operationTimeout', 'Loading cloud config timed out')
+        ),
+        withTimeout(
+          ipcManager.invoke('cloud:get-games'),
+          LOAD_DATA_TIMEOUT_MS,
+          createCloudUiError('operationTimeout', 'Loading cloud games timed out')
+        ),
+        withTimeout(
+          ipcManager.invoke('cloud:get-task-progress'),
+          LOAD_DATA_TIMEOUT_MS,
+          createCloudUiError('operationTimeout', 'Loading cloud tasks timed out')
+        ),
+        withTimeout(
+          ipcManager.invoke('cloud:get-datesheet-status'),
+          LOAD_DATA_TIMEOUT_MS,
+          createCloudUiError('operationTimeout', 'Loading datesheet status timed out')
+        ),
+        withTimeout(
+          ipcManager.invoke('cloud:get-storage-location'),
+          LOAD_DATA_TIMEOUT_MS,
+          createCloudUiError('operationTimeout', 'Loading cloud storage location timed out')
+        )
+      ])
     setConfig(nextConfig)
     setForm(nextConfig)
     setGames(nextGames)
     setTasks(Object.fromEntries(nextTasks.map((task) => [task.taskId, task] as const)))
     setDatesheetStatus(nextDatesheetStatus)
-  }, [])
+    setStorageLocation(nextStorageLocation)
+    void loadOrphans()
+  }, [loadOrphans])
 
   useEffect(() => {
     void loadData()
@@ -186,7 +302,7 @@ function CloudArchiveView({ mode }: { mode: CloudArchiveViewMode }): React.JSX.E
         toast.error(t('notifications.loadFailed', { message: formatCloudError(error) }))
       )
       .finally(() => setIsLoading(false))
-  }, [loadData, t])
+  }, [formatCloudError, loadData, t])
 
   useEffect(() => {
     const upsertTask = (_event: unknown, task: CloudTaskProgress): void => {
@@ -210,15 +326,6 @@ function CloudArchiveView({ mode }: { mode: CloudArchiveViewMode }): React.JSX.E
       offFailed()
     }
   }, [loadData])
-
-  const formatCloudError = useCallback(
-    (error: unknown): string => {
-      const { code, message } = parseCloudError(error)
-      return t(`errors.${code}`, { message, defaultValue: message })
-    },
-    [t]
-  )
-
   const refreshDatesheetStatus = async (): Promise<void> => {
     const nextStatus = await ipcManager.invoke('cloud:get-datesheet-status')
     setDatesheetStatus(nextStatus)
@@ -261,27 +368,64 @@ function CloudArchiveView({ mode }: { mode: CloudArchiveViewMode }): React.JSX.E
     if (selected) setForm((current) => ({ ...current, [field]: selected }))
   }
 
-  const saveConfig = async (initializeDatesheet = false): Promise<void> => {
+  const saveConfig = async (): Promise<void> => {
+    const requestId = ++saveRequestIdRef.current
     setIsSaving(true)
     try {
-      const nextConfig = await ipcManager.invoke('cloud:update-config', {
-        ...form,
-        initializeDatesheet
-      })
+      const nextConfig = await withTimeout(
+        ipcManager.invoke('cloud:update-config', form),
+        SAVE_CONFIG_TIMEOUT_MS,
+        createCloudUiError('operationTimeout', 'Cloud archive configuration save timed out')
+      )
+      if (requestId !== saveRequestIdRef.current) return
       setConfig(nextConfig)
       setForm(nextConfig)
       toast.success(t('notifications.saveSuccess'))
+      void loadData().catch(() => {})
     } catch (error) {
+      if (requestId !== saveRequestIdRef.current) return
       toast.error(t('notifications.saveFailed', { message: formatCloudError(error) }))
     } finally {
-      setIsSaving(false)
+      if (requestId === saveRequestIdRef.current) setIsSaving(false)
     }
   }
 
-  const startTask = async (label: string, promise: Promise<unknown>): Promise<void> => {
+  const initializeDatesheets = async (): Promise<void> => {
+    setIsInitializingDatesheet(true)
+    try {
+      const nextStatus = await withTimeout(
+        ipcManager.invoke('cloud:initialize-datesheets', form),
+        INITIALIZE_DATESHEET_TIMEOUT_MS,
+        createCloudUiError('operationTimeout', 'Cloud archive datesheet initialization timed out')
+      )
+      setDatesheetStatus(nextStatus)
+      setInitializeDatesheetOpen(false)
+      toast.success(t('notifications.initializeDatesheetSuccess'))
+      void loadData().catch(() => {})
+    } catch (error) {
+      toast.error(t('notifications.initializeDatesheetFailed', { message: formatCloudError(error) }))
+    } finally {
+      setIsInitializingDatesheet(false)
+    }
+  }
+
+  const startTask = async (label: string, invoke: () => Promise<unknown>): Promise<void> => {
+    if (!config.enabled) {
+      toast.error(t('errors.notEnabled'))
+      return
+    }
+    if (!datesheetsPaired) {
+      if (canInitializeDatesheets) setInitializeDatesheetOpen(true)
+      toast.error(t('notifications.initializeRequired'))
+      return
+    }
     toast.promise(
-      promise.then(async () => {
-        await loadData()
+      withTimeout(
+        invoke(),
+        TASK_START_TIMEOUT_MS,
+        createCloudUiError('operationTimeout', 'Cloud archive task start timed out')
+      ).then(() => {
+        void loadData().catch(() => {})
       }),
       {
         loading: t('notifications.taskStarting', { label }),
@@ -291,10 +435,85 @@ function CloudArchiveView({ mode }: { mode: CloudArchiveViewMode }): React.JSX.E
     )
   }
 
-  const openArchive = async (game: CloudGameSummary): Promise<void> => {
-    const target = game.archiveDir || `${config.cloudRoot}\\${game.gameId}`
+
+  const switchToPortableMode = async (): Promise<void> => {
+    if (storageLocation?.isPortableMode) return
+    const needsAdmin = await ipcManager.invoke('system:check-if-portable-directory-needs-admin-rights')
+    if (needsAdmin) {
+      toast.error(t('notifications.portableAdminRequired'))
+      return
+    }
+    toast.promise(
+      (async () => {
+        await ipcManager.invoke('app:switch-database-mode')
+        void loadData().catch(() => {})
+        toast.info(t('notifications.restartCountdown'))
+        setTimeout(() => {
+          ipcManager.send('app:relaunch-app')
+        }, 3000)
+      })(),
+      {
+        loading: t('notifications.switchingPortable'),
+        success: t('notifications.switchPortableSuccess'),
+        error: (error) => t('notifications.switchPortableFailed', { message: formatCloudError(error) })
+      }
+    )
+  }
+
+  const restoreOrphan = async (orphan: CloudOrphanSummary): Promise<void> => {
+    toast.promise(
+      ipcManager.invoke('cloud:restore-local-orphan', orphan.gameId).then(() => {
+        void loadData().catch(() => {})
+      }),
+      {
+        loading: t('notifications.restoringOrphan', { name: orphan.gameName }),
+        success: t('notifications.restoreOrphanSuccess', { name: orphan.gameName }),
+        error: (error) => t('notifications.restoreOrphanFailed', { message: formatCloudError(error) })
+      }
+    )
+  }
+
+  const archiveOrphan = async (orphan: CloudOrphanSummary): Promise<void> => {
+    await startTask(t('actions.archiveOrphan'), () =>
+      ipcManager.invoke('cloud:archive-local-orphan', orphan.gameId)
+    )
+  }
+
+  const getOrphanLocalPath = (orphan: CloudOrphanSummary): string => {
+    return orphan.localPath ? joinRootPath(config.localRoot, orphan.localPath) : ''
+  }
+
+  const getOrphanArchivePath = (orphan: CloudOrphanSummary): string => {
+    return orphan.archiveDir ? joinRootPath(config.cloudRoot, orphan.archiveDir) : ''
+  }
+
+  const openPath = async (target: string): Promise<void> => {
     if (!target) return
-    await ipcManager.invoke('system:open-path-in-explorer', target)
+    try {
+      const [exists] = await withTimeout(
+        ipcManager.invoke('system:check-if-path-exist', [target]),
+        OPEN_PATH_TIMEOUT_MS,
+        createCloudUiError('operationTimeout', 'Check path timed out')
+      )
+      if (!exists) {
+        toast.error(t('notifications.openPathFailed', { message: target }))
+        return
+      }
+      await withTimeout(
+        ipcManager.invoke('system:open-path-in-explorer', target),
+        OPEN_PATH_TIMEOUT_MS,
+        createCloudUiError('operationTimeout', 'Open path timed out')
+      )
+    } catch (error) {
+      toast.error(t('notifications.openPathFailed', { message: formatCloudError(error) }))
+    }
+  }
+
+  const openArchive = async (game: CloudGameSummary): Promise<void> => {
+    const target = game.archiveDir
+      ? joinRootPath(config.cloudRoot, game.archiveDir)
+      : joinRootPath(config.cloudRoot, game.gameId)
+    await openPath(target)
   }
 
   const renderConfigPath = (
@@ -358,6 +577,47 @@ function CloudArchiveView({ mode }: { mode: CloudArchiveViewMode }): React.JSX.E
     </Card>
   )
 
+  const renderStorageLocation = (): React.ReactNode => (
+    <Card className="p-4 rounded-lg">
+      <div className="flex items-center justify-between gap-3 mb-4">
+        <div className="min-w-0">
+          <div className="text-sm font-medium">{t('storage.title')}</div>
+          <div className="text-xs text-muted-foreground truncate">{t('storage.description')}</div>
+        </div>
+        <Badge variant={storageLocation?.isPortableMode ? 'default' : 'secondary'}>
+          {storageLocation?.isPortableMode ? t('storage.portable') : t('storage.normal')}
+        </Badge>
+      </div>
+      <div className="grid grid-cols-1 gap-3 text-sm lg:grid-cols-2">
+        <div className="min-w-0">
+          <div className="mb-1 text-xs text-muted-foreground">{t('storage.configPath')}</div>
+          <div className="truncate" title={storageLocation?.configPath}>
+            {storageLocation?.configPath || '--'}
+          </div>
+        </div>
+        <div className="min-w-0">
+          <div className="mb-1 text-xs text-muted-foreground">{t('storage.databaseRoot')}</div>
+          <div className="truncate" title={storageLocation?.databaseRoot}>
+            {storageLocation?.databaseRoot || '--'}
+          </div>
+        </div>
+        <div className="min-w-0 lg:col-span-2">
+          <div className="mb-1 text-xs text-muted-foreground">{t('storage.appRoot')}</div>
+          <div className="truncate" title={storageLocation?.appRootPath}>
+            {storageLocation?.appRootPath || '--'}
+          </div>
+        </div>
+      </div>
+      {!storageLocation?.isPortableMode && (
+        <div className="flex flex-wrap items-center justify-between gap-3 p-3 mt-4 rounded-lg bg-amber-500/10 text-amber-600">
+          <div className="text-xs">{t('storage.notPortableWarning')}</div>
+          <Button variant="outline" size="sm" onClick={() => void switchToPortableMode()}>
+            {t('actions.switchToPortable')}
+          </Button>
+        </div>
+      )}
+    </Card>
+  )
   const canAutoImportNewGames = form.enabled && Boolean(form.cloudRoot && form.localRoot)
 
   const renderConfigEditor = (): React.ReactNode => (
@@ -517,14 +777,18 @@ function CloudArchiveView({ mode }: { mode: CloudArchiveViewMode }): React.JSX.E
           {t('datesheet.title')}
         </div>
         <div className="flex flex-wrap gap-2">
-          {datesheetStatus?.canInitialize && (
+          {canInitializeDatesheets && (
             <Button
               variant="outline"
               size="sm"
               onClick={() => setInitializeDatesheetOpen(true)}
-              disabled={isSaving}
+              disabled={isSaving || isInitializingDatesheet}
             >
-              <Wrench className="w-4 h-4" />
+              {isInitializingDatesheet ? (
+                <Loader2 className="w-4 h-4 animate-spin" />
+              ) : (
+                <Wrench className="w-4 h-4" />
+              )}
               {t('actions.initializeDatesheet')}
             </Button>
           )}
@@ -595,6 +859,110 @@ function CloudArchiveView({ mode }: { mode: CloudArchiveViewMode }): React.JSX.E
     </Card>
   )
 
+  const renderOrphanList = (): React.ReactNode => (
+    <Card className="p-0 rounded-lg gap-0">
+      <div className="flex items-center justify-between p-4 border-b bg-muted/[calc(var(--glass-opacity)/2)] rounded-t-lg">
+        <div className="text-sm font-medium">{t('orphans.title')}</div>
+        <div className="flex items-center gap-2">
+          {isOrphansLoading && <Loader2 className="w-4 h-4 animate-spin text-muted-foreground" />}
+          <Badge variant={orphans.length > 0 ? 'secondary' : 'outline'}>
+            {t('orphans.count', { count: orphans.length })}
+          </Badge>
+        </div>
+      </div>
+      <div className="divide-y">
+        {orphanLoadError ? (
+          <div className="flex flex-wrap items-center justify-between gap-3 p-4 text-sm text-muted-foreground">
+            <div className="flex items-center min-w-0 gap-3">
+              <AlertTriangle className="w-4 h-4 text-amber-500" />
+              <span className="truncate">{t('orphans.loadFailed', { message: orphanLoadError })}</span>
+            </div>
+            <Button variant="outline" size="sm" onClick={() => void loadOrphans()}>
+              <RefreshCw className="w-4 h-4" />
+              {t('actions.recheck')}
+            </Button>
+          </div>
+        ) : isOrphansLoading && orphans.length === 0 ? (
+          <div className="flex flex-col items-center justify-center p-10 text-muted-foreground">
+            <Loader2 className="w-10 h-10 mb-3 animate-spin opacity-40" />
+            <p className="text-sm">{t('orphans.loading')}</p>
+          </div>
+        ) : orphans.length > 0 ? (
+          orphans.map((orphan) => (
+            <div key={`${orphan.kind}-${orphan.gameId}`} className="flex flex-wrap items-center justify-between gap-3 p-4">
+              <div className="flex items-center min-w-0 gap-3">
+                <AlertTriangle className="w-4 h-4 text-amber-500" />
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <div className="text-sm font-medium truncate">{orphan.gameName}</div>
+                    <Badge variant={orphan.kind === 'dbMissingFiles' ? 'destructive' : 'secondary'}>
+                      {t(`orphans.kind.${orphan.kind}`)}
+                    </Badge>
+                  </div>
+                  <div className="text-xs text-muted-foreground truncate">{orphan.reason}</div>
+                  <div className="text-xs text-muted-foreground truncate" title={getOrphanLocalPath(orphan)}>
+                    {t('config.localRoot')}: {getOrphanLocalPath(orphan) || '--'}
+                  </div>
+                  <div className="text-xs text-muted-foreground truncate" title={getOrphanArchivePath(orphan)}>
+                    {t('config.cloudRoot')}: {getOrphanArchivePath(orphan) || '--'}
+                  </div>
+                </div>
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-xs text-muted-foreground">
+                  {orphan.sizeBytes > 0 ? formatStorageSize(orphan.sizeBytes) : t('orphans.sizeUnknown')}
+                </span>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => void openPath(getOrphanLocalPath(orphan))}
+                  disabled={!orphan.hasLocalDir}
+                >
+                  <FolderOpen className="w-4 h-4" />
+                  {t('actions.openLocal')}
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => void openPath(getOrphanArchivePath(orphan))}
+                  disabled={!orphan.hasCloudDir}
+                >
+                  <FolderOpen className="w-4 h-4" />
+                  {t('actions.openArchive')}
+                </Button>
+                {orphan.canRestore && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => void restoreOrphan(orphan)}
+                    disabled={!datesheetReady}
+                  >
+                    <RefreshCw className="w-4 h-4" />
+                    {t('actions.restoreOrphan')}
+                  </Button>
+                )}
+                {orphan.canArchive && (
+                  <Button
+                    size="sm"
+                    onClick={() => void archiveOrphan(orphan)}
+                    disabled={!datesheetReady}
+                  >
+                    <CloudUpload className="w-4 h-4" />
+                    {t('actions.archiveOrphan')}
+                  </Button>
+                )}
+              </div>
+            </div>
+          ))
+        ) : (
+          <div className="flex flex-col items-center justify-center p-10 text-muted-foreground">
+            <ShieldCheck className="w-14 h-14 mb-3 opacity-20" />
+            <p className="text-sm">{t('orphans.empty')}</p>
+          </div>
+        )}
+      </div>
+    </Card>
+  )
   const renderGameList = (): React.ReactNode => (
     <Card className="flex flex-col flex-grow rounded-lg p-0 gap-0">
       <div className="flex items-center justify-between p-4 border-b bg-muted/[calc(var(--glass-opacity)/2)] rounded-t-lg">
@@ -609,7 +977,7 @@ function CloudArchiveView({ mode }: { mode: CloudArchiveViewMode }): React.JSX.E
               className="flex flex-wrap items-center justify-between gap-3 p-4"
             >
               <div className="flex items-center min-w-0 gap-3">
-                {game.status === 'cloud' ? (
+                {hasDownloadableArchive(game) ? (
                   <Cloud className="w-4 h-4 text-muted-foreground" />
                 ) : (
                   <HardDrive className="w-4 h-4 text-muted-foreground" />
@@ -648,15 +1016,16 @@ function CloudArchiveView({ mode }: { mode: CloudArchiveViewMode }): React.JSX.E
                   <FolderOpen className="w-4 h-4" />
                   {t('actions.openArchive')}
                 </Button>
-                {game.status === 'cloud' ? (
+                {hasDownloadableArchive(game) ? (
                   <Button
                     size="sm"
                     onClick={() =>
                       void startTask(
                         t('actions.download'),
-                        ipcManager.invoke('cloud:download-game-to-local', game.gameId)
+                        () => ipcManager.invoke('cloud:download-game-to-local', game.gameId)
                       )
                     }
+                    disabled={!datesheetReady}
                   >
                     <CloudDownload className="w-4 h-4" />
                     {t('actions.download')}
@@ -668,10 +1037,10 @@ function CloudArchiveView({ mode }: { mode: CloudArchiveViewMode }): React.JSX.E
                     onClick={() =>
                       void startTask(
                         t('actions.migrate'),
-                        ipcManager.invoke('cloud:migrate-game-to-cloud', game.gameId)
+                        () => ipcManager.invoke('cloud:migrate-game-to-cloud', game.gameId)
                       )
                     }
-                    disabled={game.status === 'syncing'}
+                    disabled={!datesheetReady || game.status === 'syncing'}
                   >
                     <CloudUpload className="w-4 h-4" />
                     {t('actions.migrate')}
@@ -683,10 +1052,10 @@ function CloudArchiveView({ mode }: { mode: CloudArchiveViewMode }): React.JSX.E
                   onClick={() =>
                     void startTask(
                       t('actions.rebuild'),
-                      ipcManager.invoke('cloud:rebuild-archive', game.gameId)
+                      () => ipcManager.invoke('cloud:rebuild-archive', game.gameId)
                     )
                   }
-                  disabled={game.status === 'cloud' || game.status === 'syncing'}
+                  disabled={!datesheetReady || hasDownloadableArchive(game) || game.status === 'syncing'}
                 >
                   <RefreshCw className="w-4 h-4" />
                   {t('actions.rebuild')}
@@ -727,8 +1096,10 @@ function CloudArchiveView({ mode }: { mode: CloudArchiveViewMode }): React.JSX.E
           <AlertDialogFooter>
             <AlertDialogCancel>{t('actions.cancel')}</AlertDialogCancel>
             <AlertDialogAction
-              onClick={() => void saveConfig(true).finally(() => setInitializeDatesheetOpen(false))}
+              onClick={() => void initializeDatesheets()}
+              disabled={isInitializingDatesheet}
             >
+              {isInitializingDatesheet && <Loader2 className="w-4 h-4 animate-spin" />}
               {t('actions.confirm')}
             </AlertDialogAction>
           </AlertDialogFooter>
@@ -811,10 +1182,10 @@ function CloudArchiveView({ mode }: { mode: CloudArchiveViewMode }): React.JSX.E
                       onClick={() =>
                         void startTask(
                           t('actions.importExisting'),
-                          ipcManager.invoke('cloud:import-existing-games')
+                          () => ipcManager.invoke('cloud:import-existing-games')
                         )
                       }
-                      disabled={!config.enabled}
+                      disabled={!datesheetReady}
                     >
                       <CloudUpload className="w-4 h-4" />
                       {t('actions.importExisting')}
@@ -838,6 +1209,9 @@ function CloudArchiveView({ mode }: { mode: CloudArchiveViewMode }): React.JSX.E
                     {t('metrics.syncing', { count: stats.syncing })}
                   </Badge>
                   <Badge variant="destructive">{t('metrics.error', { count: stats.error })}</Badge>
+                  <Badge variant={orphans.length > 0 ? 'secondary' : 'outline'}>
+                    {t('metrics.orphans', { count: orphans.length })}
+                  </Badge>
                   <Badge variant={localUsageVariant}>
                     <HardDrive className="w-3.5 h-3.5" />
                     {t('metrics.localBytes', { size: formatStorageSize(stats.localBytes) })}
@@ -848,12 +1222,14 @@ function CloudArchiveView({ mode }: { mode: CloudArchiveViewMode }): React.JSX.E
               {isSettings ? (
                 <>
                   {renderConfigEditor()}
+                  {renderStorageLocation()}
                   {renderDatesheetStatus()}
                 </>
               ) : (
                 <>
                   {renderConfigSummary()}
                   {renderTaskList()}
+                  {renderOrphanList()}
                   {renderGameList()}
                 </>
               )}

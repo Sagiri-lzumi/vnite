@@ -9,6 +9,16 @@ import { useGameMetadataUpdaterStore } from '../GameMetadataUpdater/store'
 import { useGameAdderStore } from './store'
 import { requestCloudAutoImportPrompt, shouldPromptCloudAutoImportForPath } from './cloudAutoImport'
 
+function normalizePathForCompare(value: string): string {
+  return value.replace(/\\/g, '/').replace(/\/+$/g, '').toLowerCase()
+}
+
+function isPathInsideRoot(filePath: string, rootPath: string): boolean {
+  if (!filePath || !rootPath) return true
+  const file = normalizePathForCompare(filePath)
+  const root = normalizePathForCompare(rootPath)
+  return file === root || file.startsWith(`${root}/`)
+}
 export function BackgroundList(): React.JSX.Element {
   const { t } = useTranslation(['adder', 'game'])
   const {
@@ -21,6 +31,7 @@ export function BackgroundList(): React.JSX.Element {
     dbId,
     dirPath,
     gamePath,
+    useGamePathAsLauncher,
     enableUpscale,
     setEnableUpscale,
     handleClose
@@ -121,9 +132,13 @@ export function BackgroundList(): React.JSX.Element {
         toast.loading(t('gameAdder.backgrounds.notifications.adding'), {
           id: 'adding-game'
         })
+        const selectedGamePath = useGamePathAsLauncher ? gamePath : ''
+        if (selectedGamePath && !isPathInsideRoot(selectedGamePath, dirPath)) {
+          throw new Error(t('gameAdder.search.notifications.gamePathOutsideRoot'))
+        }
         const shouldPromptCloudAutoImport = await shouldPromptCloudAutoImportForPath(
           dirPath,
-          gamePath,
+          selectedGamePath,
           dataSource,
           dataSourceId,
           dbId
@@ -134,7 +149,7 @@ export function BackgroundList(): React.JSX.Element {
           backgroundUrl,
           upscaleEnabled: enableUpscale,
           dirPath,
-          gamePath
+          gamePath: selectedGamePath
         })
         if (shouldPromptCloudAutoImport) await requestCloudAutoImportPrompt(gameId)
         setIsAdding(false)

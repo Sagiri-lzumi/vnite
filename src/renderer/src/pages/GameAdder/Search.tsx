@@ -4,6 +4,7 @@ import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 import { ipcManager } from '~/app/ipc'
 import { Button } from '~/components/ui/button'
+import { Checkbox } from '~/components/ui/checkbox'
 import { Input } from '~/components/ui/input'
 import {
   Select,
@@ -19,6 +20,16 @@ import { GameList, useGameAdderStore } from './store'
 import { useGameLocalState } from '~/hooks'
 import { requestCloudAutoImportPrompt, shouldPromptCloudAutoImportForPath } from './cloudAutoImport'
 
+function normalizePathForCompare(value: string): string {
+  return value.replace(/\\/g, '/').replace(/\/+$/g, '').toLowerCase()
+}
+
+function isPathInsideRoot(filePath: string, rootPath: string): boolean {
+  if (!filePath || !rootPath) return true
+  const file = normalizePathForCompare(filePath)
+  const root = normalizePathForCompare(rootPath)
+  return file === root || file.startsWith(`${root}/`)
+}
 export function Search({ className }: { className?: string }): React.JSX.Element {
   const { t } = useTranslation('adder')
   const {
@@ -29,6 +40,8 @@ export function Search({ className }: { className?: string }): React.JSX.Element
     setName,
     gamePath,
     setGamePath,
+    useGamePathAsLauncher,
+    setUseGamePathAsLauncher,
     dirPath,
     setDirPath,
     dataSourceId,
@@ -150,11 +163,16 @@ export function Search({ className }: { className?: string }): React.JSX.Element
       toast.warning(t('gameAdder.search.notifications.selectGamePath'))
       return
     }
+    const selectedGamePath = useGamePathAsLauncher ? gamePath : ''
+    if (selectedGamePath && !isPathInsideRoot(selectedGamePath, dirPath)) {
+      toast.warning(t('gameAdder.search.notifications.gamePathOutsideRoot'))
+      return
+    }
     toast.promise(
       (async (): Promise<void> => {
         const shouldPromptCloudAutoImport = await shouldPromptCloudAutoImportForPath(
           dirPath,
-          gamePath,
+          selectedGamePath,
           undefined,
           undefined,
           dbId
@@ -162,7 +180,7 @@ export function Search({ className }: { className?: string }): React.JSX.Element
         const gameId = await ipcManager.invoke(
           'adder:add-game-to-db-without-metadata',
           dirPath,
-          gamePath
+          selectedGamePath
         )
         if (shouldPromptCloudAutoImport) await requestCloudAutoImportPrompt(gameId)
         handleClose()
@@ -186,26 +204,69 @@ export function Search({ className }: { className?: string }): React.JSX.Element
       return
     }
     const newdirPath = window.api.path.dirname(selectedPath)
-    setDirPath(newdirPath)
+    if (!dirPath) setDirPath(newdirPath)
     setGamePath(selectedPath)
+    setUseGamePathAsLauncher(true)
   }
 
+
+  async function selectRootPath(): Promise<void> {
+    const selectedPath = await ipcManager.invoke(
+      'system:select-path-dialog',
+      ['openDirectory'],
+      undefined,
+      dirPath || (gamePath ? window.api.path.dirname(gamePath) : undefined)
+    )
+    if (!selectedPath) return
+    setDirPath(selectedPath)
+  }
   return (
     <div className={cn('w-[500px] h-auto', className)}>
       <div className={cn('grid grid-cols-[auto_1fr] gap-x-5 gap-y-2 text-sm items-center')}>
         {dbId ? (
           <PathRowWithDb gameId={dbId} />
         ) : (
-          (gamePath || dirPath) && (
-            <>
-              <div className={cn('whitespace-nowrap select-none pb-1.5')}>
-                {t('gameAdder.search.gamePath')}
-              </div>
-              <div className={cn('text-xs text-muted-foreground break-all select-text pb-1.5')}>
-                {gamePath || dirPath || '-'}
-              </div>
-            </>
-          )
+          <>
+            <div className={cn('whitespace-nowrap select-none pb-1.5')}>
+              {t('gameAdder.search.startupFile')}
+            </div>
+            <div className={cn('flex flex-row gap-3 pb-1.5')}>
+              <Input
+                className={cn('flex-1')}
+                placeholder={t('gameAdder.search.gamePathPlaceholder')}
+                value={gamePath}
+                readOnly
+              />
+              <Button variant={'outline'} size={'icon'} onClick={selectGamePath}>
+                <span className={cn('icon-[mdi--file-outline] w-5 h-5')}></span>
+              </Button>
+            </div>
+
+            <div />
+            <label className={cn('flex items-center gap-2 text-xs text-muted-foreground select-none pb-1.5')}>
+              <Checkbox
+                checked={Boolean(gamePath && useGamePathAsLauncher)}
+                disabled={!gamePath}
+                onCheckedChange={(checked) => setUseGamePathAsLauncher(Boolean(checked))}
+              />
+              <span>{t('gameAdder.search.useStartupFile')}</span>
+            </label>
+
+            <div className={cn('whitespace-nowrap select-none pb-1.5')}>
+              {t('gameAdder.search.rootPath')}
+            </div>
+            <div className={cn('flex flex-row gap-3 pb-1.5')}>
+              <Input
+                className={cn('flex-1')}
+                placeholder={t('gameAdder.search.rootPathPlaceholder')}
+                value={dirPath}
+                readOnly
+              />
+              <Button variant={'outline'} size={'icon'} onClick={selectRootPath}>
+                <span className={cn('icon-[mdi--folder-outline] w-5 h-5')}></span>
+              </Button>
+            </div>
+          </>
         )}
 
         {/* Data source selection */}
@@ -273,19 +334,8 @@ export function Search({ className }: { className?: string }): React.JSX.Element
           </>
         ) : (
           <>
-            <div className={cn('whitespace-nowrap select-none')}>
-              {t('gameAdder.search.gamePath')}
-            </div>
-            <div className={cn('flex flex-row gap-3')}>
-              <Input
-                className={cn('flex-1')}
-                placeholder={t('gameAdder.search.gamePathPlaceholder')}
-                value={gamePath || dirPath}
-                readOnly
-              />
-              <Button variant={'outline'} size={'icon'} onClick={selectGamePath}>
-                <span className={cn('icon-[mdi--file-outline] w-5 h-5')}></span>
-              </Button>
+            <div />
+            <div className={cn('flex flex-row justify-end')}>
               <Button onClick={addGameDirectly}>{t('gameAdder.search.addButton')}</Button>
             </div>
           </>

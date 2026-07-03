@@ -46,6 +46,8 @@ interface GameAdderState {
   setDirPath: (dirPath: string) => void
   gamePath: string
   setGamePath: (gamePath: string) => void
+  useGamePathAsLauncher: boolean
+  setUseGamePathAsLauncher: (useGamePathAsLauncher: boolean) => void
   pendingCloudAutoImport: PendingCloudAutoImport | null
   setPendingCloudAutoImport: (pending: PendingCloudAutoImport | null) => void
   handleClose: () => void
@@ -78,6 +80,8 @@ export const useGameAdderStore = create<GameAdderState>((set, get) => ({
   setDirPath: (dirPath): void => set({ dirPath }),
   gamePath: '',
   setGamePath: (gamePath): void => set({ gamePath }),
+  useGamePathAsLauncher: true,
+  setUseGamePathAsLauncher: (useGamePathAsLauncher): void => set({ useGamePathAsLauncher }),
   pendingCloudAutoImport: null,
   setPendingCloudAutoImport: (pending): void => set({ pendingCloudAutoImport: pending }),
   handleClose: (): void => {
@@ -95,7 +99,8 @@ export const useGameAdderStore = create<GameAdderState>((set, get) => ({
       setGameList,
       setIsLoading,
       setDirPath,
-      setGamePath
+      setGamePath,
+      setUseGamePathAsLauncher
     } = get()
     if (isLoading) {
       toast.warning(i18next.t('adder:gameAdder.loading'))
@@ -107,6 +112,7 @@ export const useGameAdderStore = create<GameAdderState>((set, get) => ({
     setDbId('')
     setDirPath('')
     setGamePath('')
+    setUseGamePathAsLauncher(true)
     setDataSourceId('')
     setName('')
     setBackgroundList([])

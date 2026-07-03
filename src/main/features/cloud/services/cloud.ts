@@ -6,11 +6,14 @@ import {
   CloudDatesheetStatusReport,
   CloudGameStatus,
   CloudGameSummary,
+  CloudOrphanSummary,
+  CloudStorageLocationInfo,
   CloudStorageRole,
   CloudTaskPhase,
   CloudTaskProgress,
   configLocalDocs,
   DEFAULT_GAME_LOCAL_VALUES,
+  DEFAULT_GAME_VALUES,
   gameLocalDoc
 } from '@appTypes/models'
 import { generateUUID, getErrorMessage } from '@appUtils'
@@ -20,10 +23,13 @@ import fse from 'fs-extra'
 import path from 'path'
 import { ChildProcessWithoutNullStreams, spawn } from 'child_process'
 import { createHash } from 'crypto'
-import { promises as fs } from 'fs'
+import { createReadStream, createWriteStream, promises as fs, ReadStream, WriteStream } from 'fs'
+import { pipeline } from 'stream/promises'
 import { ConfigDBManager, GameDBManager } from '~/core/database'
+import { eventBus } from '~/core/events'
 import { ipcManager } from '~/core/ipc'
 import { ActiveGameInfo } from '~/features/game/services'
+import { getAppRootPath, getDataPath, portableStore } from '~/features/system'
 import { isPathWithinRoot, normalizePath, pathEquals } from '~/utils'
 
 const DATESHEET_FILE = '.vnite-cloud-datesheet.json'
@@ -34,9 +40,22 @@ const DATESHEET_CORRUPT_PREFIX = '.vnite-cloud-datesheet.corrupt'
 const TMP_DIR = '.vnite-tmp'
 const DEFAULT_VOLUME_SIZE_BYTES = 2 * 1024 * 1024 * 1024
 const DATESHEET_LOCK_TIMEOUT_MS = 30 * 60 * 1000
+const CONFIG_IO_TIMEOUT_MS = 20_000
+const DATESHEET_WRITE_TIMEOUT_MS = 30_000
+const DIRECTORY_OPERATION_TIMEOUT_MS = 120_000
+const SEVEN_ZIP_IDLE_TIMEOUT_MS = 10 * 60 * 1000
+const SEVEN_ZIP_WATCHDOG_INTERVAL_MS = 15_000
+const COPY_FILE_IDLE_TIMEOUT_MS = 5 * 60 * 1000
+const COPY_FILE_WATCHDOG_INTERVAL_MS = 15_000
+const CLOUD_TASK_IDLE_TIMEOUT_MS = 15 * 60 * 1000
+const CLOUD_TASK_WATCHDOG_INTERVAL_MS = 15_000
+const TERMINAL_TASK_RETENTION_MS = 60_000
+const MAX_INLINE_DATESHEET_FILE_NAMES = 2_000
+const OPTIONAL_DATESHEET_MAX_BYTES = 8 * 1024 * 1024
+const OPTIONAL_DATESHEET_WRITE_TIMEOUT_MS = 8_000
 
 type CloudStorageConfig = configLocalDocs['game']['cloudStorage']
-type CloudConfigUpdate = Partial<CloudStorageConfig> & { initializeDatesheet?: boolean }
+type CloudConfigUpdate = Partial<CloudStorageConfig>
 type DateSheetReadResult =
   | { status: 'ok'; datesheet: CloudDatesheet; recoveredFromBackup: boolean }
   | {
@@ -63,12 +82,18 @@ interface CloudTaskState {
   canceled: boolean
   previousCloud?: gameLocalDoc['cloud']
   child?: ChildProcessWithoutNullStreams
+  copyStreams: Set<{ source: ReadStream; target: WriteStream }>
+  lastProgressEmitAt: number
+  lastProgressEmitBytes: number
 }
 
 const tasksById = new Map<string, CloudTaskState>()
 const taskIdByGameId = new Map<string, string>()
 const datesheetQueues = new Map<string, Promise<unknown>>()
 let archiveIoQueue: Promise<void> = Promise.resolve()
+let cloudTaskQueue: Promise<void> = Promise.resolve()
+const PROGRESS_THROTTLE_MS = 250
+const PROGRESS_THROTTLE_BYTES = 16 * 1024 * 1024
 
 class CloudArchiveError extends Error {
   constructor(
@@ -78,6 +103,29 @@ class CloudArchiveError extends Error {
     super(message)
     this.name = `CloudArchiveError:${code}`
   }
+}
+
+function withOperationTimeout<T>(
+  promise: Promise<T>,
+  label: string,
+  timeoutMs = CONFIG_IO_TIMEOUT_MS
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new CloudArchiveError(`${label} timed out`, 'operationTimeout')),
+      timeoutMs
+    )
+    promise.then(
+      (value) => {
+        clearTimeout(timer)
+        resolve(value)
+      },
+      (error) => {
+        clearTimeout(timer)
+        reject(error)
+      }
+    )
+  })
 }
 
 function nowIso(): string {
@@ -217,6 +265,17 @@ function emptyLockInfo(): CloudDatesheetLockInfo {
   }
 }
 
+function isProcessProbablyAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false
+  if (pid === process.pid) return true
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
 async function readDatesheetLock(root: string): Promise<CloudDatesheetLockInfo> {
   const lockPath = datesheetLockPath(root)
   if (!root || !(await pathExists(lockPath))) return emptyLockInfo()
@@ -227,11 +286,12 @@ async function readDatesheetLock(root: string): Promise<CloudDatesheetLockInfo> 
     const createdAt = typeof lock.createdAt === 'string' ? lock.createdAt : ''
     const createdAtMs = createdAt ? new Date(createdAt).getTime() : 0
     const ageMs = createdAtMs > 0 ? Date.now() - createdAtMs : Number.MAX_SAFE_INTEGER
+    const pid = typeof lock.pid === 'number' ? lock.pid : 0
     return {
       exists: true,
-      expired: ageMs > DATESHEET_LOCK_TIMEOUT_MS,
+      expired: ageMs > DATESHEET_LOCK_TIMEOUT_MS || !isProcessProbablyAlive(pid),
       operationId: typeof lock.operationId === 'string' ? lock.operationId : '',
-      pid: typeof lock.pid === 'number' ? lock.pid : 0,
+      pid,
       createdAt,
       ageMs,
       error: ''
@@ -253,14 +313,18 @@ async function acquireDatesheetLock(
   root: string,
   operationId: string
 ): Promise<() => Promise<void>> {
+  const lockPath = datesheetLockPath(root)
   const lock = await readDatesheetLock(root)
   if (lock.exists) {
-    if (lock.expired)
+    if (!isProcessProbablyAlive(lock.pid)) {
+      await fse.remove(lockPath).catch(() => {})
+    } else if (lock.expired) {
       throw new CloudArchiveError('Datesheet lock is stale and needs user cleanup', 'lockTimeout')
-    throw new CloudArchiveError('Datesheet is busy with another operation', 'lockBusy')
+    } else {
+      throw new CloudArchiveError('Datesheet is busy with another operation', 'lockBusy')
+    }
   }
 
-  const lockPath = datesheetLockPath(root)
   await fse.writeFile(
     lockPath,
     JSON.stringify({ operationId, pid: process.pid, createdAt: nowIso() }, null, 2),
@@ -294,7 +358,7 @@ function assertRelativeStringList(
   if (strings.some((value) => path.isAbsolute(value) || /^[A-Za-z]:[\\/]/.test(value))) {
     throw new CloudArchiveError(`Datesheet ${field} must use relative paths`, 'schemaInvalid')
   }
-  if (requireSorted) {
+  if (requireSorted && strings.length <= MAX_INLINE_DATESHEET_FILE_NAMES) {
     const sorted = [...strings].sort((a, b) => a.localeCompare(b, undefined, { numeric: true }))
     if (strings.some((value, index) => value !== sorted[index])) {
       throw new CloudArchiveError(`Datesheet ${field} must be sorted`, 'schemaInvalid')
@@ -313,14 +377,14 @@ function validateDatesheetGameEntry(entry: CloudDatesheetGameEntry, gameId: stri
     throw new CloudArchiveError('Invalid datesheet game status', 'schemaInvalid')
   if (typeof entry.localManagedPath !== 'string' || typeof entry.archiveDir !== 'string')
     throw new CloudArchiveError('Invalid datesheet game paths', 'schemaInvalid')
-  const fileNames = assertRelativeStringList(entry.fileNames, 'fileNames', true)
+  const fileNames = assertRelativeStringList(entry.fileNames ?? [], 'fileNames', true)
   const archiveParts = assertRelativeStringList(entry.archiveParts, 'archiveParts', true)
   if (!Number.isFinite(entry.sizeBytes) || entry.sizeBytes < 0)
     throw new CloudArchiveError('Invalid datesheet sizeBytes', 'schemaInvalid')
   if (
     !Number.isInteger(entry.fileCount) ||
     entry.fileCount < 0 ||
-    entry.fileCount !== fileNames.length
+    (fileNames.length > 0 && entry.fileCount !== fileNames.length)
   )
     throw new CloudArchiveError('Invalid datesheet fileCount', 'schemaInvalid')
   if (typeof entry.fileListHash !== 'string' || !entry.fileListHash)
@@ -387,6 +451,15 @@ function assertDatesheetRead(result: DateSheetReadResult, root: string): CloudDa
   throw new CloudArchiveError(`Cloud datesheet at ${root} is ${result.status}`, result.status)
 }
 
+async function readDatesheetForOperation(
+  root: string,
+  role: CloudStorageRole,
+  label: string,
+  timeoutMs = CONFIG_IO_TIMEOUT_MS
+): Promise<DateSheetReadResult> {
+  return await withOperationTimeout(readDatesheet(root, role), label, timeoutMs)
+}
+
 function createEmptyDatesheet(pairId: string, role: CloudStorageRole): CloudDatesheet {
   const timestamp = nowIso()
   return {
@@ -402,31 +475,71 @@ function createEmptyDatesheet(pairId: string, role: CloudStorageRole): CloudDate
 
 async function enqueueDatesheetWrite<T>(root: string, action: () => Promise<T>): Promise<T> {
   const key = path.resolve(root)
-  const previous = datesheetQueues.get(key) ?? Promise.resolve()
-  const next = previous.catch(() => undefined).then(action)
+  const previous = datesheetQueues.get(key)
+  if (previous) {
+    await withOperationTimeout(
+      previous.catch(() => undefined),
+      `Waiting for previous datesheet write at ${root}`,
+      DATESHEET_WRITE_TIMEOUT_MS
+    ).catch((error) => {
+      if (datesheetQueues.get(key) === previous) datesheetQueues.delete(key)
+      throw error
+    })
+  }
+
+  const next = withOperationTimeout(action(), `Writing datesheet at ${root}`, DATESHEET_WRITE_TIMEOUT_MS)
   datesheetQueues.set(
     key,
-    next.finally(() => datesheetQueues.get(key) === next && datesheetQueues.delete(key))
+    next.finally(() => {
+      if (datesheetQueues.get(key) === next) datesheetQueues.delete(key)
+    })
   )
   return await next
 }
 
 async function writeDatesheet(root: string, datesheet: CloudDatesheet): Promise<void> {
   await enqueueDatesheetWrite(root, async () => {
-    await fse.ensureDir(root)
+    await withOperationTimeout(fse.ensureDir(root), `Ensuring datesheet root ${root}`)
     const operationId = datesheet.lastOperationId || generateUUID()
-    const releaseLock = await acquireDatesheetLock(root, operationId)
+    const releaseLock = await withOperationTimeout(
+      acquireDatesheetLock(root, operationId),
+      `Acquiring datesheet lock at ${root}`
+    )
     try {
       const filePath = datesheetPath(root)
       const tmpPath = datesheetTmpPath(root)
       const bakPath = datesheetBakPath(root)
-      const nextDatesheet = { ...datesheet, lastOperationId: operationId, updatedAt: nowIso() }
-      if (await pathExists(filePath)) await fse.copy(filePath, bakPath, { overwrite: true })
-      await fse.writeFile(tmpPath, JSON.stringify(nextDatesheet, null, 2), 'utf-8')
-      validateDatesheetSchema(await readJsonFile<CloudDatesheet>(tmpPath), nextDatesheet.role)
-      await fse.move(tmpPath, filePath, { overwrite: true })
-      validateDatesheetSchema(await readJsonFile<CloudDatesheet>(filePath), nextDatesheet.role)
-      await fse.remove(tmpPath).catch(() => {})
+      const compactDatesheet = compactDatesheetForWrite(datesheet)
+      const nextDatesheet = { ...compactDatesheet, lastOperationId: operationId, updatedAt: nowIso() }
+      if (await withOperationTimeout(pathExists(filePath), `Checking datesheet at ${root}`)) {
+        await withOperationTimeout(
+          fse.copy(filePath, bakPath, { overwrite: true }),
+          `Backing up datesheet at ${root}`
+        )
+      }
+      await withOperationTimeout(
+        fse.writeFile(tmpPath, JSON.stringify(nextDatesheet, null, 2), 'utf-8'),
+        `Writing temporary datesheet at ${root}`
+      )
+      validateDatesheetSchema(
+        await withOperationTimeout(
+          readJsonFile<CloudDatesheet>(tmpPath),
+          `Reading temporary datesheet at ${root}`
+        ),
+        nextDatesheet.role
+      )
+      await withOperationTimeout(
+        fse.move(tmpPath, filePath, { overwrite: true }),
+        `Promoting datesheet at ${root}`
+      )
+      validateDatesheetSchema(
+        await withOperationTimeout(
+          readJsonFile<CloudDatesheet>(filePath),
+          `Verifying datesheet at ${root}`
+        ),
+        nextDatesheet.role
+      )
+      await withOperationTimeout(fse.remove(tmpPath).catch(() => {}), `Cleaning datesheet tmp at ${root}`)
     } catch (error) {
       if (error instanceof CloudArchiveError) throw error
       throw new CloudArchiveError(
@@ -434,7 +547,9 @@ async function writeDatesheet(root: string, datesheet: CloudDatesheet): Promise<
         'writeFailed'
       )
     } finally {
-      await releaseLock()
+      await withOperationTimeout(releaseLock(), `Releasing datesheet lock at ${root}`).catch((error) => {
+        log.warn('[Cloud] Failed to release datesheet lock in time:', error)
+      })
     }
   })
 }
@@ -442,8 +557,16 @@ async function ensureConfiguredDatesheets(
   config: CloudStorageConfig,
   initializeDatesheet: boolean
 ): Promise<void> {
-  const localResult = await readDatesheet(config.localRoot, 'localCache')
-  const cloudResult = await readDatesheet(config.cloudRoot, 'cloudArchive')
+  const localResult = await readDatesheetForOperation(
+    config.localRoot,
+    'localCache',
+    'Reading local datesheet during readiness check'
+  )
+  const cloudResult = await readDatesheetForOperation(
+    config.cloudRoot,
+    'cloudArchive',
+    'Reading cloud datesheet during readiness check'
+  )
   if (localResult.status === 'ok' && cloudResult.status === 'ok') {
     if (localResult.recoveredFromBackup || cloudResult.recoveredFromBackup) {
       throw new CloudArchiveError(
@@ -483,11 +606,19 @@ async function ensureConfiguredDatesheets(
     throw new CloudArchiveError(`Cloud datesheet is ${cloudResult.status}`, cloudResult.status)
 
   const local = assertDatesheetRead(
-    await readDatesheet(config.localRoot, 'localCache'),
+    await readDatesheetForOperation(
+      config.localRoot,
+      'localCache',
+      'Verifying initialized local datesheet'
+    ),
     config.localRoot
   )
   const cloud = assertDatesheetRead(
-    await readDatesheet(config.cloudRoot, 'cloudArchive'),
+    await readDatesheetForOperation(
+      config.cloudRoot,
+      'cloudArchive',
+      'Verifying initialized cloud datesheet'
+    ),
     config.cloudRoot
   )
   if (local.pairId !== cloud.pairId)
@@ -506,7 +637,10 @@ async function canRestoreDatesheetFromBackup(
   const backupPath = datesheetBakPath(root)
   if (!(await pathExists(backupPath))) return false
   try {
-    const backup = await readJsonFile<CloudDatesheet>(backupPath)
+    const backup = await withOperationTimeout(
+    readJsonFile<CloudDatesheet>(backupPath),
+    'Reading datesheet backup'
+  )
     validateDatesheetSchema(backup, role)
     return true
   } catch {
@@ -518,8 +652,8 @@ async function getDatesheetSideStatus(
   root: string,
   role: CloudStorageRole
 ): Promise<CloudDatesheetSideStatus> {
-  const lock = await readDatesheetLock(root)
-  const base: CloudDatesheetSideStatus = {
+  let lock = emptyLockInfo()
+  const createBase = (): CloudDatesheetSideStatus => ({
     role,
     root,
     filePath: root ? datesheetPath(root) : '',
@@ -535,40 +669,70 @@ async function getDatesheetSideStatus(
     canRestoreFromBackup: false,
     lock,
     error: ''
-  }
+  })
 
-  if (!root) return base
+  if (!root) return createBase()
 
-  const hasRootContent = await directoryHasContent(root)
-  const result = await readDatesheet(root, role)
-  const canRestoreFromBackup = await canRestoreDatesheetFromBackup(root, role)
-  if (result.status === 'ok') {
+  try {
+    lock = await withOperationTimeout(
+      readDatesheetLock(root),
+      `Reading ${role} datesheet lock`,
+      5_000
+    )
+  } catch (error) {
     return {
-      ...base,
-      status: result.recoveredFromBackup ? 'recoveredFromBackup' : 'ok',
-      exists: await pathExists(datesheetPath(root)),
-      recoveredFromBackup: result.recoveredFromBackup,
-      pairId: result.datesheet.pairId,
-      pairIdShort: result.datesheet.pairId.slice(0, 8),
-      schemaVersion: result.datesheet.schemaVersion,
-      gameCount: Object.keys(result.datesheet.games || {}).length,
-      updatedAt: result.datesheet.updatedAt,
-      hasRootContent,
-      canRestoreFromBackup,
-      error: result.recoveredFromBackup ? 'Official datesheet is corrupted; backup is readable' : ''
+      ...createBase(),
+      status: 'operationTimeout',
+      error: getErrorMessage(error)
     }
   }
 
-  return {
-    ...base,
-    status: result.status,
-    exists: await pathExists(datesheetPath(root)),
-    hasRootContent,
-    canRestoreFromBackup,
-    error: result.error || ''
+  const base = createBase()
+  try {
+    const [hasRootContent, result, canRestoreFromBackup, exists] = await Promise.all([
+      withOperationTimeout(directoryHasContent(root), `Reading ${role} root content`, 5_000),
+      withOperationTimeout(readDatesheet(root, role), `Reading ${role} datesheet`, 5_000),
+      withOperationTimeout(
+        canRestoreDatesheetFromBackup(root, role),
+        `Reading ${role} datesheet backup`,
+        5_000
+      ),
+      withOperationTimeout(pathExists(datesheetPath(root)), `Checking ${role} datesheet file`, 5_000)
+    ])
+
+    if (result.status === 'ok') {
+      return {
+        ...base,
+        status: result.recoveredFromBackup ? 'recoveredFromBackup' : 'ok',
+        exists,
+        recoveredFromBackup: result.recoveredFromBackup,
+        pairId: result.datesheet.pairId,
+        pairIdShort: result.datesheet.pairId.slice(0, 8),
+        schemaVersion: result.datesheet.schemaVersion,
+        gameCount: Object.keys(result.datesheet.games || {}).length,
+        updatedAt: result.datesheet.updatedAt,
+        hasRootContent,
+        canRestoreFromBackup,
+        error: result.recoveredFromBackup ? 'Official datesheet is corrupted; backup is readable' : ''
+      }
+    }
+
+    return {
+      ...base,
+      status: result.status,
+      exists,
+      hasRootContent,
+      canRestoreFromBackup,
+      error: result.error || ''
+    }
+  } catch (error) {
+    return {
+      ...base,
+      status: 'operationTimeout',
+      error: getErrorMessage(error)
+    }
   }
 }
-
 export async function getCloudDatesheetStatus(): Promise<CloudDatesheetStatusReport> {
   const config = await getConfig()
   const [local, cloud] = await Promise.all([
@@ -604,25 +768,50 @@ export async function restoreDatesheetFromBackup(
   if (!(await pathExists(backupPath)))
     throw new CloudArchiveError('Datesheet backup does not exist', 'backupMissing')
 
-  const backup = await readJsonFile<CloudDatesheet>(backupPath)
+  const backup = await withOperationTimeout(
+    readJsonFile<CloudDatesheet>(backupPath),
+    'Reading datesheet backup'
+  )
   validateDatesheetSchema(backup, role)
 
   await enqueueDatesheetWrite(root, async () => {
     const operationId = generateUUID()
-    const releaseLock = await acquireDatesheetLock(root, operationId)
+    const releaseLock = await withOperationTimeout(
+      acquireDatesheetLock(root, operationId),
+      'Acquiring datesheet restore lock'
+    )
     try {
       const filePath = datesheetPath(root)
       const tmpPath = datesheetTmpPath(root)
-      if (await pathExists(filePath))
-        await fse.copy(filePath, datesheetCorruptPath(root), { overwrite: false })
+      if (await withOperationTimeout(pathExists(filePath), 'Checking current datesheet before restore'))
+        await withOperationTimeout(
+          fse.copy(filePath, datesheetCorruptPath(root), { overwrite: false }),
+          'Backing up corrupt datesheet before restore',
+          DIRECTORY_OPERATION_TIMEOUT_MS
+        )
       const restored = { ...backup, updatedAt: nowIso(), lastOperationId: operationId }
-      await fse.writeFile(tmpPath, JSON.stringify(restored, null, 2), 'utf-8')
-      validateDatesheetSchema(await readJsonFile<CloudDatesheet>(tmpPath), role)
-      await fse.move(tmpPath, filePath, { overwrite: true })
-      validateDatesheetSchema(await readJsonFile<CloudDatesheet>(filePath), role)
-      await fse.remove(tmpPath).catch(() => {})
+      await withOperationTimeout(
+        fse.writeFile(tmpPath, JSON.stringify(restored, null, 2), 'utf-8'),
+        'Writing restored datesheet'
+      )
+      validateDatesheetSchema(
+        await withOperationTimeout(readJsonFile<CloudDatesheet>(tmpPath), 'Verifying restored temp datesheet'),
+        role
+      )
+      await withOperationTimeout(
+        fse.move(tmpPath, filePath, { overwrite: true }),
+        'Promoting restored datesheet',
+        DIRECTORY_OPERATION_TIMEOUT_MS
+      )
+      validateDatesheetSchema(
+        await withOperationTimeout(readJsonFile<CloudDatesheet>(filePath), 'Reading restored datesheet'),
+        role
+      )
+      await withOperationTimeout(fse.remove(tmpPath).catch(() => {}), 'Cleaning restore tmp datesheet')
     } finally {
-      await releaseLock()
+      await withOperationTimeout(releaseLock(), 'Releasing datesheet restore lock').catch((error) => {
+        log.warn('[Cloud] Failed to release datesheet restore lock:', error)
+      })
     }
   })
 
@@ -638,7 +827,10 @@ export async function cleanupDatesheetLock(
   const lock = await readDatesheetLock(root)
   if (!lock.exists) return await getCloudDatesheetStatus()
   if (!lock.expired) throw new CloudArchiveError('Datesheet lock is not expired', 'lockBusy')
-  await fse.remove(datesheetLockPath(root))
+  await withOperationTimeout(
+    fse.remove(datesheetLockPath(root)),
+    'Removing stale datesheet lock'
+  )
   return await getCloudDatesheetStatus()
 }
 async function getConfig(): Promise<CloudStorageConfig> {
@@ -649,50 +841,128 @@ export async function getCloudConfig(): Promise<CloudStorageConfig> {
   return await getConfig()
 }
 
-export async function updateCloudConfig(update: CloudConfigUpdate): Promise<CloudStorageConfig> {
-  const current = await getConfig()
-  const initializeDatesheet = Boolean(update.initializeDatesheet)
-  const { initializeDatesheet: _ignored, ...cleanUpdate } = update
-  const next = normalizeConfig({ ...current, ...cleanUpdate })
+function isCompleteCloudConfigUpdate(update: CloudConfigUpdate): update is CloudStorageConfig {
+  return (
+    typeof update.enabled === 'boolean' &&
+    typeof update.cloudRoot === 'string' &&
+    typeof update.localRoot === 'string' &&
+    typeof update.localLimitBytes === 'number' &&
+    update.archiveFormat === '7z' &&
+    typeof update.volumeSizeBytes === 'number' &&
+    typeof update.sevenZipPath === 'string' &&
+    typeof update.autoImportNewGames === 'boolean'
+  )
+}
+
+async function resolveCloudConfigUpdate(update: CloudConfigUpdate): Promise<CloudStorageConfig> {
+  if (isCompleteCloudConfigUpdate(update)) return normalizeConfig(update)
+  return normalizeConfig({ ...(await getConfig()), ...update })
+}
+
+async function saveCloudConfigUpdate(update: CloudConfigUpdate): Promise<CloudStorageConfig> {
+  const next = await resolveCloudConfigUpdate(update)
   if (!next.enabled || !next.cloudRoot || !next.localRoot) {
     next.autoImportNewGames = false
   }
-  if (next.enabled) {
-    await ensureWritableDirectory(next.localRoot, 'Local cache directory')
-    await ensureWritableDirectory(next.cloudRoot, 'Cloud archive directory')
-    if (pathEquals(path.resolve(next.localRoot), path.resolve(next.cloudRoot))) {
-      throw new CloudArchiveError(
-        'Local cache and cloud archive directories cannot be the same',
-        'sameRoot'
-      )
-    }
-    await ensureConfiguredDatesheets(next, initializeDatesheet)
-    if (
-      next.sevenZipPath &&
-      (!(await pathExists(next.sevenZipPath)) ||
-        !(await validateSevenZipExecutable(next.sevenZipPath)))
-    ) {
-      throw new CloudArchiveError('Configured 7-Zip path is invalid.', 'sevenZipInvalid')
-    }
-  }
-  await ConfigDBManager.setConfigLocalValue('game.cloudStorage', next)
+  validateCloudConfigForSave(next)
+  await withOperationTimeout(
+    ConfigDBManager.setConfigLocalValue('game.cloudStorage', next),
+    'Saving cloud archive config'
+  )
   return next
+}
+
+async function validateCloudStorageRoots(config: CloudStorageConfig): Promise<void> {
+  await withOperationTimeout(
+    ensureWritableDirectory(config.localRoot, 'Local cache directory'),
+    'Checking local cache directory'
+  )
+  await withOperationTimeout(
+    ensureWritableDirectory(config.cloudRoot, 'Cloud archive directory'),
+    'Checking cloud archive directory'
+  )
+  if (pathEquals(path.resolve(config.localRoot), path.resolve(config.cloudRoot))) {
+    throw new CloudArchiveError(
+      'Local cache and cloud archive directories cannot be the same',
+      'sameRoot'
+    )
+  }
+}
+
+function validateCloudConfigForSave(config: CloudStorageConfig): void {
+  if (!config.enabled) return
+  if (!config.localRoot || !config.cloudRoot) {
+    throw new CloudArchiveError('Cloud archive directories are not configured', 'pathEmpty')
+  }
+  if (pathEquals(path.resolve(config.localRoot), path.resolve(config.cloudRoot))) {
+    throw new CloudArchiveError(
+      'Local cache and cloud archive directories cannot be the same',
+      'sameRoot'
+    )
+  }
+}
+
+export async function updateCloudConfig(update: CloudConfigUpdate): Promise<CloudStorageConfig> {
+  return await saveCloudConfigUpdate(update)
+}
+
+export async function initializeCloudDatesheets(
+  update?: CloudConfigUpdate
+): Promise<CloudDatesheetStatusReport> {
+  const config = update ? await saveCloudConfigUpdate(update) : await getConfig()
+  await validateCloudStorageRoots(config)
+  await withOperationTimeout(
+    ensureConfiguredDatesheets(config, true),
+    'Initializing cloud archive datesheets'
+  )
+  return await getCloudDatesheetStatus()
 }
 
 async function ensureReadyConfig(): Promise<CloudStorageConfig> {
   const config = await getConfig()
   if (!config.enabled) throw new CloudArchiveError('Cloud archive is not enabled', 'notEnabled')
-  await ensureWritableDirectory(config.localRoot, 'Local cache directory')
-  await ensureWritableDirectory(config.cloudRoot, 'Cloud archive directory')
-  await ensureConfiguredDatesheets(config, false)
+  await withOperationTimeout(
+    ensureWritableDirectory(config.localRoot, 'Local cache directory'),
+    'Checking local cache directory'
+  )
+  await withOperationTimeout(
+    ensureWritableDirectory(config.cloudRoot, 'Cloud archive directory'),
+    'Checking cloud archive directory'
+  )
+  await withOperationTimeout(
+    ensureConfiguredDatesheets(config, false),
+    'Checking cloud archive datesheets'
+  )
   return config
 }
 
-async function listManifest(root: string): Promise<FileManifest> {
+async function listManifest(
+  root: string,
+  task?: CloudTaskState,
+  scanMessage = 'Scanning files'
+): Promise<FileManifest> {
   const entries: Array<{ relativePath: string; size: number }> = []
+  let scannedBytes = 0
+  let lastEmitAt = 0
+
+  const emitScanProgress = (force = false): void => {
+    if (!task) return
+    const now = Date.now()
+    if (!force && now - lastEmitAt < PROGRESS_THROTTLE_MS) return
+    lastEmitAt = now
+    updateProgress(task, {
+      percent: task.progress.percent,
+      processedBytes: task.progress.processedBytes,
+      totalBytes: task.progress.totalBytes,
+      message: scanMessage + ' (' + entries.length + ' files)'
+    })
+  }
+
   async function walk(current: string): Promise<void> {
+    if (task) assertTaskNotCanceled(task)
     const dirents = await fse.readdir(current, { withFileTypes: true })
     for (const dirent of dirents) {
+      if (task) assertTaskNotCanceled(task)
       if (dirent.name === TMP_DIR) continue
       const fullPath = path.join(current, dirent.name)
       const relativePath = normalizePath(path.relative(root, fullPath))
@@ -700,22 +970,47 @@ async function listManifest(root: string): Promise<FileManifest> {
       else if (dirent.isFile()) {
         const stat = await fse.stat(fullPath)
         entries.push({ relativePath, size: stat.size })
+        scannedBytes += stat.size
+        emitScanProgress()
       }
     }
   }
+
+  emitScanProgress(true)
   await walk(root)
   entries.sort((a, b) => a.relativePath.localeCompare(b.relativePath, undefined, { numeric: true }))
   const hash = createHash('sha256')
-  let sizeBytes = 0
   for (const entry of entries) {
-    sizeBytes += entry.size
-    hash.update(`${entry.relativePath}\0${entry.size}\n`)
+    hash.update(entry.relativePath + '\0' + entry.size + '\n')
   }
+  emitScanProgress(true)
   return {
     fileNames: entries.map((entry) => entry.relativePath),
     fileCount: entries.length,
-    sizeBytes,
+    sizeBytes: scannedBytes,
     fileListHash: hash.digest('hex')
+  }
+}
+
+function getInlineDatesheetFileNames(manifest: FileManifest): string[] {
+  return manifest.fileCount <= MAX_INLINE_DATESHEET_FILE_NAMES ? manifest.fileNames : []
+}
+
+function compactDatesheetForWrite(datesheet: CloudDatesheet): CloudDatesheet {
+  return {
+    ...datesheet,
+    games: Object.fromEntries(
+      Object.entries(datesheet.games).map(([gameId, entry]) => [
+        gameId,
+        {
+          ...entry,
+          fileNames:
+            (entry.fileNames ?? []).length <= MAX_INLINE_DATESHEET_FILE_NAMES
+              ? (entry.fileNames ?? [])
+              : []
+        }
+      ])
+    )
   }
 }
 
@@ -739,7 +1034,7 @@ function createGameEntry(params: {
     archiveParts: params.archiveParts,
     sizeBytes: params.manifest.sizeBytes,
     fileCount: params.manifest.fileCount,
-    fileNames: params.manifest.fileNames,
+    fileNames: getInlineDatesheetFileNames(params.manifest),
     fileListHash: params.manifest.fileListHash,
     archiveRevision: revision,
     localRevision: revision,
@@ -748,45 +1043,16 @@ function createGameEntry(params: {
   }
 }
 
-async function updateLocalDatesheetAfterCopy(
-  config: CloudStorageConfig,
-  gameId: string,
-  managedRoot: string,
-  archiveParts: string[],
-  manifest: FileManifest,
-  operationId: string
-): Promise<void> {
-  const datesheet = assertDatesheetRead(
-    await readDatesheet(config.localRoot, 'localCache'),
-    config.localRoot
-  )
-  const existing = datesheet.games[gameId]
-  const entry: CloudDatesheetGameEntry = {
-    gameId,
-    gameName: await getGameName(gameId),
-    status: 'local',
-    localManagedPath: managedRoot,
-    archiveDir: existing?.archiveDir || gameId,
-    archiveParts: existing?.archiveParts?.length ? existing.archiveParts : archiveParts,
-    sizeBytes: manifest.sizeBytes,
-    fileCount: manifest.fileCount,
-    fileNames: manifest.fileNames,
-    fileListHash: manifest.fileListHash,
-    archiveRevision: existing?.archiveRevision || '',
-    localRevision: generateUUID(),
-    lastVerifiedAt: nowIso(),
-    lastError: ''
-  }
-  await updateDatesheetGameEntry(config.localRoot, 'localCache', entry, operationId)
-}
-
 async function updateDatesheetGameEntry(
   root: string,
   role: CloudStorageRole,
   entry: CloudDatesheetGameEntry,
   operationId: string
 ): Promise<void> {
-  const datesheet = assertDatesheetRead(await readDatesheet(root, role), root)
+  const datesheet = assertDatesheetRead(
+    await readDatesheetForOperation(root, role, `Reading ${role} datesheet before update`),
+    root
+  )
   datesheet.lastOperationId = operationId
   datesheet.games[entry.gameId] = entry
   await writeDatesheet(root, datesheet)
@@ -798,7 +1064,10 @@ async function removeDatesheetGameEntry(
   gameId: string,
   operationId: string
 ): Promise<void> {
-  const datesheet = assertDatesheetRead(await readDatesheet(root, role), root)
+  const datesheet = assertDatesheetRead(
+    await readDatesheetForOperation(root, role, `Reading ${role} datesheet before removal`),
+    root
+  )
   if (!datesheet.games[gameId]) return
   datesheet.lastOperationId = operationId
   delete datesheet.games[gameId]
@@ -806,14 +1075,37 @@ async function removeDatesheetGameEntry(
 }
 
 async function readPairedDatesheets(
-  config: CloudStorageConfig
+  config: CloudStorageConfig,
+  task?: CloudTaskState
 ): Promise<{ local: CloudDatesheet; cloud: CloudDatesheet }> {
+  if (task) {
+    updateProgress(task, {
+      phase: 'writingDatesheet',
+      percent: 99,
+      message: 'Checking local datesheet'
+    })
+  }
   const local = assertDatesheetRead(
-    await readDatesheet(config.localRoot, 'localCache'),
+    await readDatesheetForOperation(
+      config.localRoot,
+      'localCache',
+      'Reading local datesheet for cloud archive task'
+    ),
     config.localRoot
   )
+  if (task) {
+    updateProgress(task, {
+      phase: 'writingDatesheet',
+      percent: 99,
+      message: 'Checking cloud datesheet'
+    })
+  }
   const cloud = assertDatesheetRead(
-    await readDatesheet(config.cloudRoot, 'cloudArchive'),
+    await readDatesheetForOperation(
+      config.cloudRoot,
+      'cloudArchive',
+      'Reading cloud datesheet for cloud archive task'
+    ),
     config.cloudRoot
   )
   if (local.pairId !== cloud.pairId)
@@ -824,11 +1116,68 @@ async function readPairedDatesheets(
 async function writeEntryToBothDatesheets(
   config: CloudStorageConfig,
   entry: CloudDatesheetGameEntry,
-  operationId: string
+  operationId: string,
+  task?: CloudTaskState,
+  options: { localRequired?: boolean; cloudRequired?: boolean; localFirst?: boolean } = {}
 ): Promise<void> {
-  await readPairedDatesheets(config)
-  await updateDatesheetGameEntry(config.localRoot, 'localCache', entry, operationId)
-  await updateDatesheetGameEntry(config.cloudRoot, 'cloudArchive', entry, operationId)
+  const localRequired = options.localRequired ?? false
+  const cloudRequired = options.cloudRequired ?? true
+
+  const writeSide = async (role: CloudStorageRole): Promise<void> => {
+    const isLocal = role === 'localCache'
+    const required = isLocal ? localRequired : cloudRequired
+    const label = isLocal ? 'local' : 'cloud'
+    if (task) {
+      updateProgress(task, {
+        phase: 'writingDatesheet',
+        percent: 99,
+        message: `Writing ${label} datesheet`
+      })
+    }
+    const root = isLocal ? config.localRoot : config.cloudRoot
+    try {
+      if (!required) {
+        const stat = await withOperationTimeout(
+          fse.stat(datesheetPath(root)),
+          `Checking ${label} datesheet size`,
+          5_000
+        ).catch(() => null)
+        if (stat && stat.size > OPTIONAL_DATESHEET_MAX_BYTES) {
+          throw new CloudArchiveError(
+            `${label} datesheet is too large to update during a cloud task`,
+            'datesheetTooLarge'
+          )
+        }
+      }
+      const updatePromise = updateDatesheetGameEntry(root, role, entry, operationId)
+      if (required) await updatePromise
+      else {
+        await withOperationTimeout(
+          updatePromise,
+          `Updating optional ${label} datesheet`,
+          OPTIONAL_DATESHEET_WRITE_TIMEOUT_MS
+        )
+      }
+    } catch (error) {
+      if (required) throw error
+      log.warn(`[Cloud] Skipped non-critical ${label} datesheet update:`, error)
+      if (task) {
+        updateProgress(task, {
+          phase: 'writingDatesheet',
+          percent: 99,
+          message: `${label[0].toUpperCase()}${label.slice(1)} datesheet update skipped; continuing`
+        })
+      }
+    }
+  }
+
+  if (options.localFirst) {
+    await writeSide('localCache')
+    await writeSide('cloudArchive')
+  } else {
+    await writeSide('cloudArchive')
+    await writeSide('localCache')
+  }
 }
 
 async function setGameCloudState(
@@ -857,7 +1206,11 @@ async function cleanupCanceledManagedCopy(
   if (previousCloud.localManagedPath && pathEquals(currentPath, previousCloud.localManagedPath)) return
   if (!isPathWithinRoot(currentPath, config.localRoot)) return
 
-  await fse.remove(currentPath).catch((cleanupError) => {
+  await withOperationTimeout(
+    fse.remove(currentPath),
+    'Removing canceled managed copy',
+    DIRECTORY_OPERATION_TIMEOUT_MS
+  ).catch((cleanupError) => {
     log.warn('[Cloud] Failed to remove canceled managed copy:', cleanupError)
   })
   await removeDatesheetGameEntry(config.localRoot, 'localCache', gameId, operationId).catch(
@@ -963,6 +1316,9 @@ function createTask(
   const timestamp = nowIso()
   const task: CloudTaskState = {
     canceled: false,
+    copyStreams: new Set(),
+    lastProgressEmitAt: 0,
+    lastProgressEmitBytes: 0,
     progress: {
       taskId: generateUUID(),
       gameId,
@@ -982,11 +1338,83 @@ function createTask(
   taskIdByGameId.set(gameId, task.progress.taskId)
   return task
 }
-
 function assertTaskNotCanceled(task: CloudTaskState): void {
   if (task.canceled) throw new CloudArchiveError('Cloud archive task was canceled', 'taskCanceled')
 }
 
+function stopTaskResources(task: CloudTaskState, error: CloudArchiveError): void {
+  for (const { source, target } of task.copyStreams) {
+    source.destroy(error)
+    target.destroy(error)
+  }
+  task.child?.kill()
+}
+
+function cancelTaskWithError(task: CloudTaskState, error: CloudArchiveError): void {
+  task.canceled = true
+  stopTaskResources(task, error)
+}
+
+async function runTaskWithIdleWatchdog<T>(
+  task: CloudTaskState,
+  action: () => Promise<T>
+): Promise<T> {
+  return await new Promise<T>((resolve, reject) => {
+    let settled = false
+    const finish = (callback: () => void): void => {
+      if (settled) return
+      settled = true
+      clearInterval(watchdog)
+      callback()
+    }
+    const watchdog = setInterval(() => {
+      if (settled) return
+      if (task.canceled) {
+        finish(() => reject(new CloudArchiveError('Cloud archive task was canceled', 'taskCanceled')))
+        return
+      }
+      const updatedAt = new Date(task.progress.updatedAt).getTime()
+      const lastActivityAt = Number.isFinite(updatedAt) ? updatedAt : Date.now()
+      if (Date.now() - lastActivityAt > CLOUD_TASK_IDLE_TIMEOUT_MS) {
+        const error = new CloudArchiveError(
+          'Cloud archive task stopped reporting progress',
+          'operationTimeout'
+        )
+        cancelTaskWithError(task, error)
+        finish(() => reject(error))
+      }
+    }, CLOUD_TASK_WATCHDOG_INTERVAL_MS)
+
+    action().then(
+      (value) => finish(() => resolve(value)),
+      (error) => finish(() => reject(error))
+    )
+  })
+}
+
+async function enqueueCloudTask<T>(
+  task: CloudTaskState,
+  phase: CloudTaskPhase,
+  message: string,
+  action: () => Promise<T>
+): Promise<T> {
+  const run = cloudTaskQueue.catch(() => undefined).then(async () => {
+    assertTaskNotCanceled(task)
+    updateProgress(task, {
+      phase,
+      percent: 0,
+      processedBytes: 0,
+      totalBytes: task.progress.totalBytes,
+      message
+    })
+    return await runTaskWithIdleWatchdog(task, action)
+  })
+  cloudTaskQueue = run.then(
+    () => undefined,
+    () => undefined
+  )
+  return await run
+}
 async function runArchiveIoSerial<T>(
   task: CloudTaskState,
   phase: CloudTaskPhase,
@@ -1017,6 +1445,7 @@ function updateProgress(
   task: CloudTaskState,
   patch: Partial<Omit<CloudTaskProgress, 'taskId' | 'gameId' | 'gameName' | 'startedAt'>>
 ): void {
+  const previousProgress = task.progress
   const startedAt = new Date(task.progress.startedAt).getTime()
   const elapsedSeconds = Math.max((Date.now() - startedAt) / 1000, 0.001)
   const processedBytes = patch.processedBytes ?? task.progress.processedBytes
@@ -1032,7 +1461,21 @@ function updateProgress(
       (speedBytesPerSecond > 0 && totalBytes > 0 ? remainingBytes / speedBytesPerSecond : null),
     updatedAt: nowIso()
   }
-  ipcManager.send('cloud:task-progress', task.progress)
+
+  const now = Date.now()
+  const phaseChanged = Boolean(patch.phase && patch.phase !== previousProgress.phase)
+  const messageChanged = Boolean(patch.message && patch.message !== previousProgress.message)
+  const terminalPhase = task.progress.phase === 'completed' || task.progress.phase === 'error'
+  const firstEmit = task.lastProgressEmitAt === 0
+  const enoughTimePassed = now - task.lastProgressEmitAt >= PROGRESS_THROTTLE_MS
+  const enoughBytesProcessed =
+    Math.abs(task.progress.processedBytes - task.lastProgressEmitBytes) >= PROGRESS_THROTTLE_BYTES
+
+  if (firstEmit || phaseChanged || messageChanged || terminalPhase || enoughTimePassed || enoughBytesProcessed) {
+    task.lastProgressEmitAt = now
+    task.lastProgressEmitBytes = task.progress.processedBytes
+    ipcManager.send('cloud:task-progress', task.progress)
+  }
 }
 
 function completeTask(task: CloudTaskState, message: string): void {
@@ -1055,8 +1498,80 @@ function failTask(task: CloudTaskState, error: unknown): void {
 }
 
 function cleanupTask(task: CloudTaskState): void {
-  tasksById.delete(task.progress.taskId)
+  const taskId = task.progress.taskId
   taskIdByGameId.delete(task.progress.gameId)
+  setTimeout(() => {
+    const current = tasksById.get(taskId)
+    if (
+      current === task &&
+      (current.progress.phase === 'completed' || current.progress.phase === 'error')
+    ) {
+      tasksById.delete(taskId)
+    }
+  }, TERMINAL_TASK_RETENTION_MS)
+}
+
+async function copyFileWithProgress(
+  sourcePath: string,
+  targetPath: string,
+  sizeBytes: number,
+  manifest: FileManifest,
+  task: CloudTaskState
+): Promise<void> {
+  await withOperationTimeout(
+    fse.ensureDir(path.dirname(targetPath)),
+    'Ensuring copy target directory',
+    DIRECTORY_OPERATION_TIMEOUT_MS
+  )
+  const source = createReadStream(sourcePath)
+  const target = createWriteStream(targetPath)
+  const pair = { source, target }
+  task.copyStreams.add(pair)
+  let lastActivityAt = Date.now()
+
+  const destroyCopy = (error: CloudArchiveError): void => {
+    source.destroy(error)
+    target.destroy(error)
+  }
+
+  const watchdog = setInterval(() => {
+    if (task.canceled) {
+      destroyCopy(new CloudArchiveError('Cloud archive task was canceled', 'taskCanceled'))
+      return
+    }
+    if (Date.now() - lastActivityAt > COPY_FILE_IDLE_TIMEOUT_MS) {
+      destroyCopy(new CloudArchiveError('Copying game file stopped reporting progress', 'operationTimeout'))
+    }
+  }, COPY_FILE_WATCHDOG_INTERVAL_MS)
+
+  source.on('data', (chunk) => {
+    lastActivityAt = Date.now()
+    if (task.canceled) {
+      destroyCopy(new CloudArchiveError('Cloud archive task was canceled', 'taskCanceled'))
+      return
+    }
+    const chunkBytes = typeof chunk === 'string' ? Buffer.byteLength(chunk) : chunk.length
+    const processedBytes = Math.min(task.progress.processedBytes + chunkBytes, manifest.sizeBytes)
+    updateProgress(task, {
+      processedBytes,
+      percent:
+        manifest.sizeBytes > 0 ? Math.min(99, (processedBytes / manifest.sizeBytes) * 100) : 99
+    })
+  })
+
+  try {
+    await pipeline(source, target)
+    assertTaskNotCanceled(task)
+    if (sizeBytes === 0) {
+      updateProgress(task, {
+        processedBytes: task.progress.processedBytes,
+        percent: manifest.sizeBytes > 0 ? task.progress.percent : 99
+      })
+    }
+  } finally {
+    clearInterval(watchdog)
+    task.copyStreams.delete(pair)
+  }
 }
 
 async function copyDirectoryWithProgress(
@@ -1084,30 +1599,44 @@ async function copyDirectoryWithProgress(
       const sourcePath = path.join(current, dirent.name)
       const targetPath = path.join(targetRoot, path.relative(sourceRoot, sourcePath))
       if (dirent.isDirectory()) {
-        await fse.ensureDir(targetPath)
+        await withOperationTimeout(
+          fse.ensureDir(targetPath),
+          'Creating copied directory',
+          DIRECTORY_OPERATION_TIMEOUT_MS
+        )
         await walk(sourcePath)
       } else if (dirent.isFile()) {
-        await fse.ensureDir(path.dirname(targetPath))
         const stat = await fse.stat(sourcePath)
-        await fse.copyFile(sourcePath, targetPath)
-        const processedBytes = task.progress.processedBytes + stat.size
-        updateProgress(task, {
-          processedBytes,
-          percent:
-            manifest.sizeBytes > 0 ? Math.min(99, (processedBytes / manifest.sizeBytes) * 100) : 99
-        })
+        await copyFileWithProgress(sourcePath, targetPath, stat.size, manifest, task)
       }
     }
   }
 
   await walk(sourceRoot)
+  updateProgress(task, {
+    processedBytes: manifest.sizeBytes,
+    percent: 99,
+    message: 'Finished copying game files; verifying local cache'
+  })
 }
-
 async function validateSevenZipExecutable(executable: string): Promise<boolean> {
   return await new Promise<boolean>((resolve) => {
     const child = spawn(executable, ['-h'], { windowsHide: true })
-    child.once('error', () => resolve(false))
-    child.once('exit', (code) => resolve(code === 0))
+    let settled = false
+    const timer = setTimeout(() => {
+      if (settled) return
+      settled = true
+      child.kill()
+      resolve(false)
+    }, CONFIG_IO_TIMEOUT_MS)
+    const finish = (value: boolean): void => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolve(value)
+    }
+    child.once('error', () => finish(false))
+    child.once('exit', (code) => finish(code === 0))
   })
 }
 
@@ -1154,7 +1683,41 @@ async function runSevenZip(
       const child = spawn(executable, args, { windowsHide: true })
       task.child = child
       let output = ''
+      let lastActivityAt = Date.now()
+      let settled = false
+
+      const killChild = (): void => {
+        try {
+          child.kill()
+        } catch (error) {
+          log.warn('[Cloud] Failed to kill 7-Zip process:', error)
+        }
+      }
+
+      const finish = (error?: unknown): void => {
+        if (settled) return
+        settled = true
+        clearInterval(watchdog)
+        task.child = undefined
+        if (error) reject(error)
+        else resolve()
+      }
+
+      const watchdog = setInterval(() => {
+        if (settled) return
+        if (task.canceled) {
+          killChild()
+          finish(new CloudArchiveError('Cloud archive task was canceled', 'taskCanceled'))
+          return
+        }
+        if (Date.now() - lastActivityAt > SEVEN_ZIP_IDLE_TIMEOUT_MS) {
+          killChild()
+          finish(new CloudArchiveError('7-Zip stopped reporting progress', 'operationTimeout'))
+        }
+      }, SEVEN_ZIP_WATCHDOG_INTERVAL_MS)
+
       const handleData = (data: Buffer): void => {
+        lastActivityAt = Date.now()
         const chunk = data.toString()
         output += chunk
         const matches = chunk.match(/(\d{1,3})%/g)
@@ -1163,6 +1726,7 @@ async function runSevenZip(
           const percent = Math.max(0, Math.min(99, Number(last.replace('%', ''))))
           updateProgress(task, {
             percent,
+            message: percent >= 99 ? message + ' - finalizing' : message,
             processedBytes:
               task.progress.totalBytes > 0
                 ? Math.floor((task.progress.totalBytes * percent) / 100)
@@ -1172,14 +1736,15 @@ async function runSevenZip(
       }
       child.stdout.on('data', handleData)
       child.stderr.on('data', handleData)
-      child.once('error', reject)
+      child.once('error', (error) => finish(error))
       child.once('exit', (code) => {
-        task.child = undefined
-        if (task.canceled)
-          reject(new CloudArchiveError('Cloud archive task was canceled', 'taskCanceled'))
-        else if (code === 0) resolve()
-        else
-          reject(new CloudArchiveError(output || `7-Zip exited with code ${code}`, 'sevenZipFailed'))
+        if (task.canceled) {
+          finish(new CloudArchiveError('Cloud archive task was canceled', 'taskCanceled'))
+        } else if (code === 0) {
+          finish()
+        } else {
+          finish(new CloudArchiveError(output || '7-Zip exited with code ' + code, 'sevenZipFailed'))
+        }
       })
     })
   })
@@ -1188,19 +1753,48 @@ async function runSevenZip(
 async function replaceDirectoryWithRollback(
   sourceDir: string,
   targetDir: string,
-  backupDir: string
+  backupDir: string,
+  task?: CloudTaskState
 ): Promise<void> {
-  await fse.remove(backupDir)
-  await fse.ensureDir(path.dirname(targetDir))
+  if (task) {
+    updateProgress(task, {
+      phase: 'verifying',
+      percent: 99,
+      message: 'Publishing archive directory'
+    })
+  }
+  await withOperationTimeout(
+    fse.remove(backupDir),
+    'Removing previous archive backup',
+    DIRECTORY_OPERATION_TIMEOUT_MS
+  )
+  await withOperationTimeout(
+    fse.ensureDir(path.dirname(targetDir)),
+    'Ensuring archive parent',
+    DIRECTORY_OPERATION_TIMEOUT_MS
+  )
 
   const hadTarget = await pathExists(targetDir)
-  if (hadTarget) await fse.move(targetDir, backupDir, { overwrite: true })
+  if (hadTarget)
+    await withOperationTimeout(
+      fse.move(targetDir, backupDir, { overwrite: true }),
+      'Backing up previous archive',
+      DIRECTORY_OPERATION_TIMEOUT_MS
+    )
 
   try {
-    await fse.move(sourceDir, targetDir, { overwrite: false })
+    await withOperationTimeout(
+      fse.move(sourceDir, targetDir, { overwrite: false }),
+      'Publishing archive directory',
+      DIRECTORY_OPERATION_TIMEOUT_MS
+    )
   } catch (error) {
     if (hadTarget && !(await pathExists(targetDir)) && (await pathExists(backupDir))) {
-      await fse.move(backupDir, targetDir, { overwrite: false }).catch((restoreError) => {
+      await withOperationTimeout(
+        fse.move(backupDir, targetDir, { overwrite: false }),
+        'Restoring previous archive',
+        DIRECTORY_OPERATION_TIMEOUT_MS
+      ).catch((restoreError) => {
         log.error(
           '[Cloud] Failed to restore previous archive after replacement failure:',
           restoreError
@@ -1210,7 +1804,43 @@ async function replaceDirectoryWithRollback(
     throw error
   }
 
-  await fse.remove(backupDir)
+  await withOperationTimeout(
+    fse.remove(backupDir),
+    'Removing archive backup',
+    DIRECTORY_OPERATION_TIMEOUT_MS
+  )
+}
+
+async function detachDirectoryForBackgroundRemoval(
+  directory: string,
+  root: string,
+  task: CloudTaskState,
+  message: string
+): Promise<void> {
+  const deleteDir = path.join(root, TMP_DIR, 'delete-' + task.progress.taskId)
+  updateProgress(task, {
+    phase: 'deleting',
+    percent: 99,
+    message
+  })
+  await withOperationTimeout(
+    fse.ensureDir(path.dirname(deleteDir)),
+    'Ensuring cleanup directory',
+    DIRECTORY_OPERATION_TIMEOUT_MS
+  )
+  await withOperationTimeout(
+    fse.remove(deleteDir),
+    'Removing stale cleanup directory',
+    DIRECTORY_OPERATION_TIMEOUT_MS
+  )
+  await withOperationTimeout(
+    fse.move(directory, deleteDir, { overwrite: false }),
+    'Moving directory to cleanup directory',
+    DIRECTORY_OPERATION_TIMEOUT_MS
+  )
+  void fse.remove(deleteDir).catch((error) => {
+    log.warn('[Cloud] Failed to remove detached cleanup directory:', error)
+  })
 }
 
 async function archiveGame(
@@ -1220,7 +1850,14 @@ async function archiveGame(
   task: CloudTaskState
 ): Promise<{ entry: CloudDatesheetGameEntry; manifest: FileManifest }> {
   const executable = await findSevenZip(config)
-  const manifest = await listManifest(sourceRoot)
+  updateProgress(task, {
+    phase: 'scanning',
+    percent: 0,
+    processedBytes: 0,
+    totalBytes: 0,
+    message: 'Scanning files for archive'
+  })
+  const manifest = await listManifest(sourceRoot, task, 'Scanning files for archive')
   const tempArchiveDir = path.join(config.cloudRoot, TMP_DIR, task.progress.taskId)
   const previousArchiveDir = path.join(
     config.cloudRoot,
@@ -1230,8 +1867,16 @@ async function archiveGame(
   const finalArchiveDir = getArchiveDir(config, gameId)
   const archiveBase = path.join(tempArchiveDir, `${gameId}.7z`)
   let archivePromoted = false
-  await fse.remove(tempArchiveDir)
-  await fse.ensureDir(tempArchiveDir)
+  await withOperationTimeout(
+    fse.remove(tempArchiveDir),
+    'Removing stale archive temp directory',
+    DIRECTORY_OPERATION_TIMEOUT_MS
+  )
+  await withOperationTimeout(
+    fse.ensureDir(tempArchiveDir),
+    'Creating archive temp directory',
+    DIRECTORY_OPERATION_TIMEOUT_MS
+  )
 
   try {
     updateProgress(task, {
@@ -1247,6 +1892,7 @@ async function archiveGame(
         'a',
         '-t7z',
         '-mx=9',
+        '-bsp1',
         `-v${config.volumeSizeBytes}b`,
         archiveBase,
         path.join(sourceRoot, '*')
@@ -1256,19 +1902,32 @@ async function archiveGame(
       'Compressing game files'
     )
 
-    const partNames = (await fse.readdir(tempArchiveDir))
+    const partNames = (await withOperationTimeout(
+      fse.readdir(tempArchiveDir),
+      'Reading generated archive parts',
+      DIRECTORY_OPERATION_TIMEOUT_MS
+    ))
       .filter((name) => name.startsWith(`${gameId}.7z.`))
       .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }))
     if (partNames.length === 0)
       throw new CloudArchiveError('No 7z archive parts were generated', 'archivePartsMissing')
     for (const part of partNames) {
-      const stat = await fse.stat(path.join(tempArchiveDir, part))
+      const stat = await withOperationTimeout(
+        fse.stat(path.join(tempArchiveDir, part)),
+        'Checking generated archive part',
+        DIRECTORY_OPERATION_TIMEOUT_MS
+      )
       if (!stat.isFile() || stat.size <= 0)
         throw new CloudArchiveError(`Archive part is invalid: ${part}`, 'archivePartsMismatch')
     }
 
+    updateProgress(task, {
+      phase: 'verifying',
+      percent: 99,
+      message: 'Verifying archive parts'
+    })
     assertTaskNotCanceled(task)
-    await replaceDirectoryWithRollback(tempArchiveDir, finalArchiveDir, previousArchiveDir)
+    await replaceDirectoryWithRollback(tempArchiveDir, finalArchiveDir, previousArchiveDir, task)
     archivePromoted = true
     const gameName = await getGameName(gameId)
     return {
@@ -1284,8 +1943,18 @@ async function archiveGame(
       })
     }
   } finally {
-    if (!archivePromoted) await fse.remove(tempArchiveDir).catch(() => {})
-    if (archivePromoted) await fse.remove(previousArchiveDir).catch(() => {})
+    if (!archivePromoted)
+      await withOperationTimeout(
+        fse.remove(tempArchiveDir),
+        'Cleaning failed archive temp directory',
+        DIRECTORY_OPERATION_TIMEOUT_MS
+      ).catch(() => {})
+    if (archivePromoted)
+      await withOperationTimeout(
+        fse.remove(previousArchiveDir),
+        'Cleaning previous archive directory',
+        DIRECTORY_OPERATION_TIMEOUT_MS
+      ).catch(() => {})
   }
 }
 
@@ -1300,12 +1969,16 @@ async function verifyArchiveParts(
     if (path.isAbsolute(part))
       throw new CloudArchiveError('Archive part path must be relative', 'archivePartsMismatch')
     const partPath = getArchivePartPath(config, gameId, part)
-    if (!(await pathExists(partPath)))
+    if (!(await withOperationTimeout(pathExists(partPath), 'Checking cloud archive part exists')))
       throw new CloudArchiveError(
         'Cloud archive may not have finished syncing yet',
         'archivePartsMissing'
       )
-    const stat = await fse.stat(partPath)
+    const stat = await withOperationTimeout(
+      fse.stat(partPath),
+      'Checking cloud archive part',
+      DIRECTORY_OPERATION_TIMEOUT_MS
+    )
     if (!stat.isFile() || stat.size <= 0)
       throw new CloudArchiveError('Cloud archive part is invalid', 'archivePartsMismatch')
   }
@@ -1318,16 +1991,21 @@ async function getArchivePartsSizeBytes(
 ): Promise<number> {
   let sizeBytes = 0
   for (const part of entry.archiveParts) {
-    const stat = await fse.stat(getArchivePartPath(config, gameId, part))
+    const stat = await withOperationTimeout(
+      fse.stat(getArchivePartPath(config, gameId, part)),
+      'Reading cloud archive part size',
+      DIRECTORY_OPERATION_TIMEOUT_MS
+    )
     sizeBytes += stat.size
   }
   return sizeBytes
 }
 async function ensureLocalCacheCapacity(
   config: CloudStorageConfig,
-  additionalBytes: number
+  additionalBytes: number,
+  task?: CloudTaskState
 ): Promise<void> {
-  const usedBytes = await getLocalRootUsedBytes(config.localRoot)
+  const usedBytes = await getLocalRootUsedBytes(config.localRoot, task)
   if (config.localLimitBytes > 0 && usedBytes + additionalBytes > config.localLimitBytes) {
     throw new CloudArchiveError('Local cache capacity is not enough', 'localLimitExceeded')
   }
@@ -1351,18 +2029,34 @@ async function ensureManagedLocalCopy(
     throw new CloudArchiveError('Local game directory does not exist', 'localPathMissing')
   }
 
-  const sourceManifest = await listManifest(currentRoot)
-  await ensureLocalCacheCapacity(config, sourceManifest.sizeBytes)
+  updateProgress(task, {
+    phase: 'scanning',
+    percent: 0,
+    processedBytes: 0,
+    totalBytes: 0,
+    message: 'Scanning local game files'
+  })
+  const sourceManifest = await listManifest(currentRoot, task, 'Scanning local game files')
+  await ensureLocalCacheCapacity(config, sourceManifest.sizeBytes, task)
 
   try {
     await copyDirectoryWithProgress(currentRoot, managedRoot, task, sourceManifest)
     assertTaskNotCanceled(task)
   } catch (error) {
     if (isPathWithinRoot(managedRoot, config.localRoot))
-      await fse.remove(managedRoot).catch(() => {})
+      await withOperationTimeout(
+        fse.remove(managedRoot),
+        'Cleaning failed managed local copy',
+        DIRECTORY_OPERATION_TIMEOUT_MS
+      ).catch(() => {})
     throw error
   }
-  const manifest = await listManifest(managedRoot)
+  updateProgress(task, {
+    phase: 'verifying',
+    percent: 99,
+    message: 'Verifying copied local cache'
+  })
+  const manifest = await listManifest(managedRoot, task, 'Verifying copied local cache')
   assertTaskNotCanceled(task)
   const migrated = migrateLocalPaths(local, currentRoot, managedRoot)
   migrated.cloud = {
@@ -1375,14 +2069,11 @@ async function ensureManagedLocalCopy(
     updatedAt: nowIso(),
     lastError: ''
   }
-  await updateLocalDatesheetAfterCopy(
-    config,
-    gameId,
-    managedRoot,
-    migrated.cloud.archiveParts,
-    manifest,
-    task.progress.taskId
-  )
+  updateProgress(task, {
+    phase: 'verifying',
+    percent: 99,
+    message: 'Local cache ready; continuing cloud archive task'
+  })
   await GameDBManager.setGameLocal(gameId, migrated)
   return { local: migrated, sourceRoot: managedRoot, managedRoot }
 }
@@ -1392,10 +2083,11 @@ async function saveArchiveResult(
   gameId: string,
   entry: CloudDatesheetGameEntry,
   status: CloudGameStatus,
-  operationId: string
+  operationId: string,
+  task?: CloudTaskState
 ): Promise<void> {
   const nextEntry = { ...entry, status, lastError: '', lastVerifiedAt: nowIso() }
-  await writeEntryToBothDatesheets(config, nextEntry, operationId)
+  await writeEntryToBothDatesheets(config, nextEntry, operationId, task)
   await setGameCloudState(gameId, status, {
     localManagedPath: getLocalManagedPath(config, gameId),
     archiveDir: getArchiveDir(config, gameId),
@@ -1411,7 +2103,12 @@ async function runImportGame(gameId: string, task: CloudTaskState): Promise<void
   const { sourceRoot } = await ensureManagedLocalCopy(config, gameId, task)
   const { entry } = await archiveGame(config, gameId, sourceRoot, task)
   assertTaskNotCanceled(task)
-  await saveArchiveResult(config, gameId, entry, 'local', task.progress.taskId)
+  updateProgress(task, {
+    phase: 'writingDatesheet',
+    percent: 99,
+    message: 'Writing archive datesheets'
+  })
+  await saveArchiveResult(config, gameId, entry, 'local', task.progress.taskId, task)
 }
 
 async function runMigrateGameToCloud(gameId: string, task: CloudTaskState): Promise<void> {
@@ -1424,7 +2121,17 @@ async function runMigrateGameToCloud(gameId: string, task: CloudTaskState): Prom
   const { entry } = await archiveGame(config, gameId, sourceRoot, task)
   assertTaskNotCanceled(task)
   const cloudEntry = { ...entry, status: 'cloud' as CloudGameStatus }
-  await writeEntryToBothDatesheets(config, cloudEntry, task.progress.taskId)
+  updateProgress(task, {
+    phase: 'writingDatesheet',
+    percent: 99,
+    message: 'Writing archive datesheets'
+  })
+  await writeEntryToBothDatesheets(config, cloudEntry, task.progress.taskId, task)
+  updateProgress(task, {
+    phase: 'verifying',
+    percent: 99,
+    message: 'Verifying cloud archive before deleting local cache'
+  })
   await verifyArchiveParts(config, gameId, cloudEntry)
   assertTaskNotCanceled(task)
 
@@ -1436,7 +2143,12 @@ async function runMigrateGameToCloud(gameId: string, task: CloudTaskState): Prom
     phase: 'deleting',
     message: 'Deleting local cache after archive verification'
   })
-  await fse.remove(managedRoot)
+  await detachDirectoryForBackgroundRemoval(
+    managedRoot,
+    config.localRoot,
+    task,
+    'Detaching local cache for background cleanup'
+  )
   await setGameCloudState(gameId, 'cloud', {
     localManagedPath: managedRoot,
     archiveDir: getArchiveDir(config, gameId),
@@ -1456,9 +2168,9 @@ async function getFreeSpaceBytes(root: string): Promise<number> {
   }
 }
 
-async function getLocalRootUsedBytes(localRoot: string): Promise<number> {
+async function getLocalRootUsedBytes(localRoot: string, task?: CloudTaskState): Promise<number> {
   if (!(await pathExists(localRoot))) return 0
-  const manifest = await listManifest(localRoot)
+  const manifest = await listManifest(localRoot, task, 'Checking local cache capacity')
   return manifest.sizeBytes
 }
 
@@ -1476,12 +2188,20 @@ async function runDownloadGameToLocal(gameId: string, task: CloudTaskState): Pro
     throw new CloudArchiveError('Local target directory already exists', 'targetExists')
 
   const estimatedBytes = entry.sizeBytes || (await getArchivePartsSizeBytes(config, gameId, entry))
-  await ensureLocalCacheCapacity(config, estimatedBytes)
+  await ensureLocalCacheCapacity(config, estimatedBytes, task)
 
   const executable = await findSevenZip(config)
   const tempExtractDir = path.join(config.localRoot, TMP_DIR, task.progress.taskId)
-  await fse.remove(tempExtractDir)
-  await fse.ensureDir(tempExtractDir)
+  await withOperationTimeout(
+    fse.remove(tempExtractDir),
+    'Removing stale extraction directory',
+    DIRECTORY_OPERATION_TIMEOUT_MS
+  )
+  await withOperationTimeout(
+    fse.ensureDir(tempExtractDir),
+    'Creating extraction directory',
+    DIRECTORY_OPERATION_TIMEOUT_MS
+  )
   updateProgress(task, {
     phase: 'extracting',
     percent: 0,
@@ -1495,14 +2215,19 @@ async function runDownloadGameToLocal(gameId: string, task: CloudTaskState): Pro
   try {
     await runSevenZip(
       executable,
-      ['x', getArchivePartPath(config, gameId, entry.archiveParts[0]), `-o${tempExtractDir}`, '-y'],
+      ['x', '-bsp1', getArchivePartPath(config, gameId, entry.archiveParts[0]), `-o${tempExtractDir}`, '-y'],
       task,
       'extracting',
       'Extracting cloud archive to local cache'
     )
 
-    manifest = await listManifest(tempExtractDir)
-    if (entry.fileNames.length && manifest.fileListHash !== entry.fileListHash) {
+    updateProgress(task, {
+      phase: 'verifying',
+      percent: 99,
+      message: 'Verifying extracted files'
+    })
+    manifest = await listManifest(tempExtractDir, task, 'Verifying extracted files')
+    if (manifest.fileListHash !== entry.fileListHash) {
       throw new CloudArchiveError(
         'Extracted files do not match cloud datesheet',
         'fileListMismatch'
@@ -1510,10 +2235,24 @@ async function runDownloadGameToLocal(gameId: string, task: CloudTaskState): Pro
     }
 
     assertTaskNotCanceled(task)
-    await fse.move(tempExtractDir, targetRoot, { overwrite: false })
+    updateProgress(task, {
+      phase: 'verifying',
+      percent: 99,
+      message: 'Publishing local cache'
+    })
+    await withOperationTimeout(
+      fse.move(tempExtractDir, targetRoot, { overwrite: false }),
+      'Publishing local cache',
+      DIRECTORY_OPERATION_TIMEOUT_MS
+    )
     extractedPromoted = true
   } finally {
-    if (!extractedPromoted) await fse.remove(tempExtractDir).catch(() => {})
+    if (!extractedPromoted)
+      await withOperationTimeout(
+        fse.remove(tempExtractDir),
+        'Cleaning failed extraction directory',
+        DIRECTORY_OPERATION_TIMEOUT_MS
+      ).catch(() => {})
   }
   if (!manifest)
     throw new CloudArchiveError('Extracted files do not match cloud datesheet', 'fileListMismatch')
@@ -1532,6 +2271,11 @@ async function runDownloadGameToLocal(gameId: string, task: CloudTaskState): Pro
   }
   await GameDBManager.setGameLocal(gameId, migrated)
 
+  updateProgress(task, {
+    phase: 'writingDatesheet',
+    percent: 99,
+    message: 'Writing local datesheet'
+  })
   const nextEntry = {
     ...entry,
     status: 'local' as CloudGameStatus,
@@ -1541,7 +2285,11 @@ async function runDownloadGameToLocal(gameId: string, task: CloudTaskState): Pro
     lastVerifiedAt: nowIso(),
     lastError: ''
   }
-  await writeEntryToBothDatesheets(config, nextEntry, task.progress.taskId)
+  await writeEntryToBothDatesheets(config, nextEntry, task.progress.taskId, task, {
+    localFirst: true,
+    localRequired: false,
+    cloudRequired: false
+  })
 }
 
 async function runRebuildArchive(gameId: string, task: CloudTaskState): Promise<void> {
@@ -1550,7 +2298,12 @@ async function runRebuildArchive(gameId: string, task: CloudTaskState): Promise<
   const { sourceRoot } = await ensureManagedLocalCopy(config, gameId, task)
   const { entry } = await archiveGame(config, gameId, sourceRoot, task)
   assertTaskNotCanceled(task)
-  await saveArchiveResult(config, gameId, entry, 'local', task.progress.taskId)
+  updateProgress(task, {
+    phase: 'writingDatesheet',
+    percent: 99,
+    message: 'Writing archive datesheets'
+  })
+  await saveArchiveResult(config, gameId, entry, 'local', task.progress.taskId, task)
 }
 
 function startCloudTask(
@@ -1559,12 +2312,12 @@ function startCloudTask(
   message: string,
   runner: (task: CloudTaskState) => Promise<void>
 ): { taskId: string } {
-  const task = createTask(gameId, gameId, phase, message)
+  const task = createTask(gameId, gameId, 'queued', 'Waiting for other cloud archive tasks')
   void (async () => {
     try {
       task.progress.gameName = await getGameName(gameId)
       task.previousCloud = cloneGameLocal(await GameDBManager.getGameLocal(gameId)).cloud
-      await runner(task)
+      await enqueueCloudTask(task, phase, message, () => runner(task))
       completeTask(task, 'Cloud archive task completed')
     } catch (error) {
       if (error instanceof CloudArchiveError && error.code === 'taskCanceled') {
@@ -1582,27 +2335,287 @@ function startCloudTask(
   return { taskId: task.progress.taskId }
 }
 
-export async function getCloudGames(): Promise<CloudGameSummary[]> {
-  const [games, localDocs] = await Promise.all([
+function isSafeGameStorageId(gameId: string): boolean {
+  return Boolean(gameId) && !path.isAbsolute(gameId) && !gameId.includes('/') && !gameId.includes('\\')
+}
+
+async function listGameStorageIds(root: string): Promise<Set<string>> {
+  if (!root || !(await pathExists(root))) return new Set()
+  const dirents = await fse.readdir(root, { withFileTypes: true })
+  return new Set(
+    dirents
+      .filter((dirent) => dirent.isDirectory())
+      .map((dirent) => dirent.name)
+      .filter((name) => name !== TMP_DIR && !name.startsWith('.') && isSafeGameStorageId(name))
+  )
+}
+
+async function readDatesheetIfAvailable(
+  root: string,
+  role: CloudStorageRole
+): Promise<CloudDatesheet | null> {
+  if (!root) return null
+  const result = await readDatesheet(root, role)
+  return result.status === 'ok' ? result.datesheet : null
+}
+
+
+export function getCloudStorageLocation(): CloudStorageLocationInfo {
+  const databaseRoot = getDataPath('')
+  return {
+    databaseRoot,
+    configPath: getDataPath('config-local'),
+    appRootPath: getAppRootPath(),
+    isPortableMode: portableStore.isPortableMode
+  }
+}
+
+export async function getCloudOrphans(): Promise<CloudOrphanSummary[]> {
+  const config = await getConfig()
+  if (!config.localRoot && !config.cloudRoot) return []
+
+  const [games, localDocs, localIds, cloudIds, localDatesheet, cloudDatesheet] = await Promise.all([
     GameDBManager.getAllGames(),
-    GameDBManager.getAllGamesLocal()
+    GameDBManager.getAllGamesLocal(),
+    withOperationTimeout(listGameStorageIds(config.localRoot), 'Scanning local cache directory'),
+    withOperationTimeout(listGameStorageIds(config.cloudRoot), 'Scanning cloud archive directory'),
+    withOperationTimeout(readDatesheetIfAvailable(config.localRoot, 'localCache'), 'Reading local datesheet'),
+    withOperationTimeout(readDatesheetIfAvailable(config.cloudRoot, 'cloudArchive'), 'Reading cloud datesheet')
   ])
-  return Object.values(games)
-    .filter((game) => game?._id && game._id !== 'collections')
-    .map((game) => {
-      const local = cloneGameLocal(localDocs[game._id])
-      return {
-        gameId: game._id,
-        gameName: game.metadata?.name || game._id,
-        status: local.cloud.status || 'local',
-        localManagedPath: local.cloud.localManagedPath,
-        archiveDir: local.cloud.archiveDir,
-        archiveParts: local.cloud.archiveParts,
-        sizeBytes: local.cloud.sizeBytes,
-        updatedAt: local.cloud.updatedAt,
-        lastError: local.cloud.lastError
+
+  const ids = new Set<string>([
+    ...localIds,
+    ...cloudIds,
+    ...Object.keys(localDatesheet?.games || {}),
+    ...Object.keys(cloudDatesheet?.games || {})
+  ])
+
+  const summaries: CloudOrphanSummary[] = []
+  for (const gameId of ids) {
+    if (!isSafeGameStorageId(gameId)) continue
+    const dbGame = games[gameId]
+    const dbLocal = cloneGameLocal(localDocs[gameId])
+    const hasDbGame = Boolean(dbGame?._id && dbGame._id !== 'collections')
+    const hasLocalDir = localIds.has(gameId)
+    const hasCloudDir = cloudIds.has(gameId)
+    const localEntry = localDatesheet?.games[gameId]
+    const cloudEntry = cloudDatesheet?.games[gameId]
+    const hasLocalDatesheetEntry = Boolean(localEntry)
+    const hasCloudDatesheetEntry = Boolean(cloudEntry)
+    const localPath = config.localRoot ? getLocalManagedPath(config, gameId) : ''
+    const archiveDir = config.cloudRoot ? getArchiveDir(config, gameId) : ''
+    const gameName = dbGame?.metadata?.name || localEntry?.gameName || cloudEntry?.gameName || gameId
+    let kind: CloudOrphanSummary['kind'] | null = null
+    let reason = ''
+
+    if (!hasDbGame && hasLocalDir) {
+      kind = 'localOnly'
+      reason = hasCloudDir
+        ? 'Local cache and cloud archive exist, but the game database record is missing.'
+        : 'Local cache exists, but the game database record is missing.'
+    } else if (!hasDbGame && hasCloudDir) {
+      kind = 'cloudOnly'
+      reason = 'Cloud archive exists, but the game database record is missing.'
+    } else if (!hasDbGame && (hasLocalDatesheetEntry || hasCloudDatesheetEntry)) {
+      kind = 'datesheetOnly'
+      reason = 'Datesheet has a game entry, but the game database record and files are incomplete.'
+    } else if (hasDbGame) {
+      const cloudState = dbLocal.cloud
+      const isCloudManaged = Boolean(
+        cloudState.localManagedPath || cloudState.archiveDir || cloudState.archiveParts.length
+      )
+      const expectedLocalPath = cloudState.localManagedPath || localPath
+      const expectedArchiveDir = cloudState.archiveDir || archiveDir
+      const expectedLocalMissing =
+        isCloudManaged && cloudState.status !== 'cloud' && !(await pathExists(expectedLocalPath))
+      const expectedCloudMissing =
+        isCloudManaged && cloudState.status === 'cloud' && !(await pathExists(expectedArchiveDir))
+      if (expectedLocalMissing || expectedCloudMissing) {
+        kind = 'dbMissingFiles'
+        reason = expectedCloudMissing
+          ? 'The game database points to a cloud archive that is missing on disk.'
+          : 'The game database points to a local cache that is missing on disk.'
       }
+    }
+
+    if (!kind) continue
+
+    const sizeBytes = localEntry?.sizeBytes || cloudEntry?.sizeBytes || dbLocal.cloud.sizeBytes || 0
+
+    summaries.push({
+      gameId,
+      gameName,
+      kind,
+      localPath,
+      archiveDir,
+      sizeBytes,
+      hasDbGame,
+      hasLocalDir,
+      hasCloudDir,
+      hasLocalDatesheetEntry,
+      hasCloudDatesheetEntry,
+      canRestore: kind === 'localOnly' && hasLocalDir && !hasDbGame,
+      canArchive: kind === 'localOnly' && hasLocalDir,
+      reason
     })
+  }
+
+  return summaries.sort((a, b) => a.gameName.localeCompare(b.gameName, undefined, { numeric: true }))
+}
+
+export async function restoreLocalOrphan(gameId: string): Promise<string> {
+  const config = await ensureReadyConfig()
+  if (!isSafeGameStorageId(gameId)) throw new CloudArchiveError('Invalid gameId', 'invalidGameId')
+  const localPath = getLocalManagedPath(config, gameId)
+  if (!(await pathExists(localPath)))
+    throw new CloudArchiveError('Local orphan cache does not exist', 'localPathMissing')
+
+  const games = await GameDBManager.getAllGames()
+  if (games[gameId]?._id && games[gameId]._id !== 'collections') return gameId
+
+  const { local, cloud } = await readPairedDatesheets(config)
+  const sourceEntry = local.games[gameId] || cloud.games[gameId]
+  const manifest = await listManifest(localPath)
+  const gameName = sourceEntry?.gameName || path.basename(localPath)
+  const operationId = generateUUID()
+
+  const gameDoc = JSON.parse(JSON.stringify(DEFAULT_GAME_VALUES))
+  gameDoc._id = gameId
+  gameDoc.record.addDate = nowIso()
+  gameDoc.metadata.name = gameName
+
+  const gameLocal = cloneGameLocal({ _id: gameId })
+  gameLocal.path.gamePath = ''
+  gameLocal.utils.markPath = localPath
+  gameLocal.utils.rootPath = localPath
+  gameLocal.cloud = {
+    ...gameLocal.cloud,
+    status: 'local',
+    localManagedPath: localPath,
+    archiveDir: getArchiveDir(config, gameId),
+    archiveParts: sourceEntry?.archiveParts || [],
+    sizeBytes: manifest.sizeBytes,
+    updatedAt: nowIso(),
+    lastError: ''
+  }
+
+  await GameDBManager.setGame(gameId, gameDoc)
+  await GameDBManager.setGameLocal(gameId, gameLocal)
+
+  const localEntry: CloudDatesheetGameEntry = sourceEntry
+    ? {
+        ...sourceEntry,
+        status: 'local',
+        localManagedPath: localPath,
+        archiveDir: gameId,
+        sizeBytes: manifest.sizeBytes,
+        fileCount: manifest.fileCount,
+        fileNames: getInlineDatesheetFileNames(manifest),
+        fileListHash: manifest.fileListHash,
+        localRevision: generateUUID(),
+        lastVerifiedAt: nowIso(),
+        lastError: ''
+      }
+    : createGameEntry({
+        gameId,
+        gameName,
+        status: 'local',
+        localManagedPath: localPath,
+        archiveDir: gameId,
+        archiveParts: [],
+        manifest
+      })
+
+  await updateDatesheetGameEntry(config.localRoot, 'localCache', localEntry, operationId)
+  if (cloud.games[gameId]) {
+    await updateDatesheetGameEntry(
+      config.cloudRoot,
+      'cloudArchive',
+      {
+        ...cloud.games[gameId],
+        status: 'local',
+        localManagedPath: localPath,
+        sizeBytes: manifest.sizeBytes,
+        lastVerifiedAt: nowIso(),
+        lastError: ''
+      },
+      operationId
+    )
+  }
+
+  eventBus.emit(
+    'game:added',
+    {
+      gameId,
+      name: gameName
+    },
+    { source: 'cloud-orphan-restore' }
+  )
+
+  return gameId
+}
+
+export async function archiveLocalOrphan(gameId: string): Promise<{ taskId: string }> {
+  await restoreLocalOrphan(gameId)
+  return importGameToCloud(gameId)
+}
+export async function getCloudGames(): Promise<CloudGameSummary[]> {
+  const [games, localDocs, config] = await Promise.all([
+    GameDBManager.getAllGames(),
+    GameDBManager.getAllGamesLocal(),
+    getConfig()
+  ])
+  return await Promise.all(
+    Object.values(games)
+      .filter((game) => game?._id && game._id !== 'collections')
+      .map(async (game) => {
+        const local = cloneGameLocal(localDocs[game._id])
+        const hasActiveTask = taskIdByGameId.has(game._id)
+        const storedStatus = local.cloud.status || 'local'
+        const localManagedPath = local.cloud.localManagedPath || (config.localRoot ? getLocalManagedPath(config, game._id) : '')
+        const archiveDir = local.cloud.archiveDir || (config.cloudRoot ? getArchiveDir(config, game._id) : '')
+        let status: CloudGameStatus = storedStatus
+        let lastError = local.cloud.lastError
+
+        if ((storedStatus === 'syncing' || storedStatus === 'error') && !hasActiveTask) {
+          const hasLocalCache = Boolean(
+            localManagedPath &&
+              (await withOperationTimeout(
+                pathExists(localManagedPath),
+                'Checking stale local cache path',
+                5_000
+              ).catch(() => false))
+          )
+          const hasCloudArchive = Boolean(
+            archiveDir &&
+              (await withOperationTimeout(
+                pathExists(archiveDir),
+                'Checking stale cloud archive path',
+                5_000
+              ).catch(() => false))
+          )
+          if (hasLocalCache) status = 'local'
+          else if (hasCloudArchive || local.cloud.archiveParts.length > 0) status = 'cloud'
+          else status = 'error'
+          lastError =
+            status === 'error'
+              ? local.cloud.lastError || 'Previous cloud archive task did not finish. Please retry.'
+              : local.cloud.lastError
+        }
+
+        return {
+          gameId: game._id,
+          gameName: game.metadata?.name || game._id,
+          status,
+          localManagedPath,
+          archiveDir,
+          archiveParts: local.cloud.archiveParts,
+          sizeBytes: local.cloud.sizeBytes,
+          updatedAt: local.cloud.updatedAt,
+          lastError
+        }
+      })
+  )
 }
 
 export async function importGameToCloud(gameId: string): Promise<{ taskId: string }> {
@@ -1662,8 +2675,7 @@ export function cancelTask(query: { gameId?: string; taskId?: string }): boolean
   if (!taskId) return false
   const task = tasksById.get(taskId)
   if (!task) return false
-  task.canceled = true
-  task.child?.kill()
+  cancelTaskWithError(task, new CloudArchiveError('Cloud archive task was canceled', 'taskCanceled'))
   return true
 }
 

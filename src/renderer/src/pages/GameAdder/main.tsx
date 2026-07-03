@@ -1,5 +1,4 @@
-import type { CloudTaskProgress } from '@appTypes/models'
-import { cn } from '~/utils'
+import { cn, waitForCloudTask } from '~/utils'
 import { Dialog, DialogContent } from '~/components/ui/dialog'
 import {
   AlertDialog,
@@ -86,40 +85,15 @@ function GameAdderContent(): React.JSX.Element {
     }
   }
 
-  const waitForCloudTask = async (startPromise: Promise<{ taskId: string }>): Promise<void> => {
-    const { taskId } = await startPromise
-    await new Promise<void>((resolve, reject) => {
-      let offCompleted: (() => void) | undefined
-      let offFailed: (() => void) | undefined
-      const cleanup = (): void => {
-        offCompleted?.()
-        offFailed?.()
-      }
-      offCompleted = ipcManager.on(
-        'cloud:task-completed',
-        (_event, progress: CloudTaskProgress) => {
-          if (progress.taskId !== taskId) return
-          cleanup()
-          resolve()
-        }
-      )
-      offFailed = ipcManager.on('cloud:task-failed', (_event, progress: CloudTaskProgress) => {
-        if (progress.taskId !== taskId) return
-        cleanup()
-        const error = new Error(progress.message) as CloudAutoImportError
-        error.code = progress.errorCode
-        reject(error)
-      })
-    })
-    useLibrarybarStore.getState().refreshGameList()
-  }
 
   const confirmCloudAutoImport = (): void => {
     const pending = pendingCloudAutoImport
     if (!pending) return
     setPendingCloudAutoImport(null)
     toast.promise(
-      waitForCloudTask(ipcManager.invoke('cloud:import-game-to-cloud', pending.gameId)),
+      waitForCloudTask(ipcManager.invoke('cloud:import-game-to-cloud', pending.gameId)).then(() =>
+        useLibrarybarStore.getState().refreshGameList()
+      ),
       {
         loading: t('gameAdder.cloudAutoImport.notifications.starting', {
           gameName: pending.gameName

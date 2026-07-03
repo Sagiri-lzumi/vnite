@@ -10,6 +10,7 @@
     "cloud": "Cloud {{count}}",
     "syncing": "Syncing {{count}}",
     "error": "Errors {{count}}",
+    "orphans": "Issues {{count}}",
     "localBytes": "Local cache {{size}}"
   },
   "actions": {
@@ -21,13 +22,17 @@
     "download": "Download",
     "rebuild": "Rebuild",
     "openArchive": "Open Archive",
+    "openLocal": "Open Local",
     "settings": "Archive Settings",
     "back": "Back",
     "recheck": "Recheck",
     "restoreBackup": "Restore Backup",
     "cleanupLock": "Clean Lock",
     "confirm": "Confirm",
-    "initializeDatesheet": "Initialize Datesheet"
+    "initializeDatesheet": "Initialize Datesheet",
+    "switchToPortable": "Move to Project Directory",
+    "restoreOrphan": "Restore Game",
+    "archiveOrphan": "Upload to Cloud"
   },
   "config": {
     "title": "Archive Configuration",
@@ -47,10 +52,34 @@
     "autoImportNewGames": "Automatically prompt Cloud Archive for newly imported games",
     "autoImportNewGamesDescription": "When enabled, newly imported games from the home import flow will prompt you to add them to Cloud Archive. Large games can take a while and use local cache and cloud archive space."
   },
+  "storage": {
+    "title": "Configuration Storage",
+    "description": "Shows where Cloud Archive settings are saved.",
+    "configPath": "Config database",
+    "databaseRoot": "Database root",
+    "appRoot": "Application root",
+    "portable": "Project directory mode",
+    "normal": "User data mode",
+    "notPortableWarning": "Cloud Archive settings currently live in the user data database. Move the database to project directory mode if you want settings to travel with this project/app folder."
+  },
   "tasks": {
     "title": "Task Progress",
     "running": "{{count}} running",
     "empty": "No cloud archive tasks"
+  },
+  "orphans": {
+    "title": "Untracked / Incomplete Files",
+    "count": "{{count}} items",
+    "empty": "No untracked cache or archive files found.",
+    "kind": {
+      "localOnly": "Local only",
+      "cloudOnly": "Cloud only",
+      "datesheetOnly": "Datesheet only",
+      "dbMissingFiles": "Missing files"
+    },
+    "loading": "Scanning untracked cache and archive folders...",
+    "loadFailed": "Could not scan untracked files: {{message}}",
+    "sizeUnknown": "Size unknown"
   },
   "games": {
     "title": "Game Archive Status",
@@ -66,7 +95,11 @@
     "error": "Error"
   },
   "phases": {
+    "queued": "Queued",
+    "scanning": "Scanning",
     "copying": "Copying",
+    "verifying": "Verifying",
+    "writingDatesheet": "Writing datesheet",
     "compressing": "Compressing",
     "deleting": "Deleting",
     "downloading": "Downloading",
@@ -81,6 +114,7 @@
     "taskStarting": "Starting {{label}}...",
     "taskStarted": "{{label}} started",
     "taskFailed": "{{label}} failed: {{message}}",
+    "openPathFailed": "Failed to open path: {{message}}",
     "downloadBeforeStart": "This game is archived in the cloud. Download it to local cache before starting.",
     "waitForSyncing": "This game is busy with a cloud archive task. Please wait for it to finish.",
     "archivePathMissing": "This game does not have a cloud archive path yet.",
@@ -96,7 +130,18 @@
     "downloadingToLocal": "Downloading to local...",
     "downloadToLocalSuccess": "Downloaded to local",
     "rebuildingArchive": "Rebuilding cloud archive...",
-    "rebuildArchiveSuccess": "Cloud archive rebuilt"
+    "rebuildArchiveSuccess": "Cloud archive rebuilt",
+    "portableAdminRequired": "Administrator permission is required to move the database to the project directory.",
+    "switchingPortable": "Moving database to project directory mode...",
+    "switchPortableSuccess": "Database moved to project directory mode",
+    "switchPortableFailed": "Failed to move database: {{message}}",
+    "restartCountdown": "Vnite will restart in 3 seconds.",
+    "restoringOrphan": "Restoring {{name}}...",
+    "restoreOrphanSuccess": "{{name}} restored",
+    "restoreOrphanFailed": "Failed to restore game: {{message}}",
+    "initializeRequired": "Initialize datesheets before using Cloud Archive tasks.",
+    "initializeDatesheetSuccess": "Datesheets initialized",
+    "initializeDatesheetFailed": "Failed to initialize datesheets: {{message}}"
   },
   "settingsTitle": "Cloud Archive Settings",
   "datesheet": {
@@ -124,7 +169,8 @@
       "pathEmpty": "Path not set",
       "lockBusy": "Locked",
       "lockTimeout": "Expired lock",
-      "unrecoverable": "Unrecoverable"
+      "unrecoverable": "Unrecoverable",
+      "operationTimeout": "Timeout"
     },
     "cleanupConfirmTitle": "Clean expired datesheet lock?",
     "cleanupConfirmDescription": "Only clean it after confirming no cloud archive task is running. After cleanup, save settings again or retry the cloud archive action.",
@@ -134,10 +180,10 @@
     "initializeNonEmptyConfirmDescription": "At least one selected directory already has content but no Vnite datesheet. This will only write datesheet marker files and will not delete existing files; confirm the selected local cache and cloud archive directories are correct."
   },
   "errors": {
-    "pathEmpty": "Set both cloud and local paths first.",
+    "pathEmpty": "Set both cloud archive and local cache directories first.",
     "pathNotWritable": "Directory is not writable: {{message}}",
     "sameRoot": "Cloud archive and local cache cannot be the same directory.",
-    "datesheetMissing": "Datesheet is missing. Save settings to initialize it.",
+    "datesheetMissing": "Datesheet is missing. Initialize datesheets before using this archive pair.",
     "recoveredFromBackup": "Datesheet official file is corrupted. Restore the backup before continuing.",
     "pairMismatch": "Local and cloud datesheets do not belong to the same pair.",
     "roleMismatch": "This directory has the wrong datesheet role.",
@@ -152,12 +198,15 @@
     "diskSpaceInsufficient": "Disk free space is not enough.",
     "sevenZipMissing": "7-Zip was not found. Install 7-Zip or set a custom path.",
     "taskCanceled": "Cloud archive task was canceled.",
+    "localPathMissing": "Local game directory does not exist.",
+    "targetExists": "The target directory already exists.",
     "invalidGameId": "This game ID cannot be safely used as a cloud archive directory name. Check the game data or wait for a compatibility migration.",
     "unknown": "{{message}}",
     "unrecoverable": "Datesheet is unrecoverable: {{message}}",
     "schemaInvalid": "Datesheet schema is invalid: {{message}}",
     "writeFailed": "Failed to write datesheet: {{message}}",
-    "sevenZipInvalid": "The custom 7-Zip path is invalid. Choose a valid 7z.exe or clear the field to use the system 7-Zip."
+    "sevenZipInvalid": "The custom 7-Zip path is invalid. Choose a valid 7z.exe or clear the field to use the system 7-Zip.",
+    "operationTimeout": "The cloud archive operation timed out: {{message}}. The cloud drive may be unresponsive, still syncing, the database may be locked by an old process, or a stale lock may remain. Check the directories and retry.",
+    "notEnabled": "Enable Cloud Archive before starting cloud archive tasks."
   }
 }
-

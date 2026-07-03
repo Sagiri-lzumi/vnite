@@ -155,25 +155,62 @@ export function stopGame(gameId: string): void {
   )
 }
 
-async function waitForCloudTask(startPromise: Promise<{ taskId: string }>): Promise<void> {
+const CLOUD_TASK_WAIT_TIMEOUT_MS = 35 * 60 * 1000
+const CLOUD_TASK_POLL_INTERVAL_MS = 1000
+
+export async function waitForCloudTask(startPromise: Promise<{ taskId: string }>): Promise<void> {
   const { taskId } = await startPromise
   await new Promise<void>((resolve, reject) => {
     let offCompleted: (() => void) | undefined
     let offFailed: (() => void) | undefined
+    let interval: number | undefined
+    let timeout: number | undefined
+    let settled = false
+
     const cleanup = (): void => {
       offCompleted?.()
       offFailed?.()
+      if (interval !== undefined) window.clearInterval(interval)
+      if (timeout !== undefined) window.clearTimeout(timeout)
     }
-    offCompleted = ipcManager.on('cloud:task-completed', (_event, progress: CloudTaskProgress) => {
-      if (progress.taskId !== taskId) return
+
+    const settle = (callback: () => void): void => {
+      if (settled) return
+      settled = true
       cleanup()
-      resolve()
+      callback()
+    }
+
+    const inspectProgress = (progress: CloudTaskProgress): void => {
+      if (progress.taskId !== taskId) return
+      if (progress.phase === 'completed') settle(resolve)
+      if (progress.phase === 'error') {
+        const error = new Error(progress.message) as Error & { code?: string }
+        error.code = progress.errorCode
+        settle(() => reject(error))
+      }
+    }
+
+    const poll = async (): Promise<void> => {
+      try {
+        const tasks = await ipcManager.invoke('cloud:get-task-progress', { taskId })
+        tasks.forEach(inspectProgress)
+      } catch {
+        // Event listeners remain authoritative; polling is a fallback for missed events.
+      }
+    }
+
+    offCompleted = ipcManager.on('cloud:task-completed', (_event, progress: CloudTaskProgress) => {
+      inspectProgress(progress)
     })
     offFailed = ipcManager.on('cloud:task-failed', (_event, progress: CloudTaskProgress) => {
-      if (progress.taskId !== taskId) return
-      cleanup()
-      reject(new Error(progress.message))
+      inspectProgress(progress)
     })
+    interval = window.setInterval(() => void poll(), CLOUD_TASK_POLL_INTERVAL_MS)
+    timeout = window.setTimeout(() => {
+      settle(() => reject(new Error(i18next.t('cloudArchive:errors.operationTimeout', { message: 'Waiting for cloud task timed out' }))))
+    }, CLOUD_TASK_WAIT_TIMEOUT_MS)
+    void poll()
   })
 }
 
@@ -204,7 +241,12 @@ export async function startGame(
   const getGameValue = gameStore.getState().getValue
 
   const cloudStatus = getGameLocalValue('cloud.status')
-  if (cloudStatus === 'cloud') {
+  const cloudArchiveDir = getGameLocalValue('cloud.archiveDir')
+  const cloudArchiveParts = getGameLocalValue('cloud.archiveParts')
+  const canDownloadFromCloud =
+    cloudStatus === 'cloud' ||
+    (cloudStatus === 'error' && (Boolean(cloudArchiveDir) || cloudArchiveParts.length > 0))
+  if (canDownloadFromCloud) {
     toast.warning(i18next.t('cloudArchive:notifications.downloadBeforeStart'), {
       action: {
         label: i18next.t('cloudArchive:actions.download'),

@@ -268,9 +268,11 @@ export async function addGameToDB({
 
     const gameLocalDoc = JSON.parse(JSON.stringify(DEFAULT_GAME_LOCAL_VALUES))
     gameLocalDoc._id = dbId
-    gameLocalDoc.utils.markPath = dirPath ?? ''
-    gameLocalDoc.utils.rootPath = inferRootPath(gameLocalDoc.utils.markPath, scanRoot)
     gameLocalDoc.path.gamePath = gamePath ?? ''
+    gameLocalDoc.utils.markPath = gamePath ? path.dirname(gamePath) : (dirPath ?? '')
+    gameLocalDoc.utils.rootPath = scanRoot
+      ? inferRootPath(gameLocalDoc.utils.markPath, scanRoot)
+      : (dirPath ?? inferRootPath(gameLocalDoc.utils.markPath))
 
     // Calculate storage size if enabled
     const autoCalculateSize = await isAutoCalculateStorageSizeEnabled()
@@ -482,8 +484,8 @@ export async function addGameToDBWithoutMetadata(
     // Set the game local document properties
     gameLocalDoc._id = dbId
     gameLocalDoc.path.gamePath = gamePath ?? ''
-    gameLocalDoc.utils.markPath = dirPath ?? ''
-    gameLocalDoc.utils.rootPath = inferRootPath(gameLocalDoc.utils.markPath)
+    gameLocalDoc.utils.markPath = gamePath ? path.dirname(gamePath) : (dirPath ?? '')
+    gameLocalDoc.utils.rootPath = dirPath ?? inferRootPath(gameLocalDoc.utils.markPath)
 
     // Calculate storage size if enabled
     const autoCalculateSize = await isAutoCalculateStorageSizeEnabled()

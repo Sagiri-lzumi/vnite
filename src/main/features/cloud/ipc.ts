@@ -1,18 +1,23 @@
 import { CloudStorageRole } from '@appTypes/models'
 import { ipcManager } from '~/core/ipc'
 import {
+  archiveLocalOrphan,
   cancelTask,
   cleanupDatesheetLock,
   downloadGameToLocal,
   getCloudConfig,
   getCloudDatesheetStatus,
   getCloudGames,
+  getCloudOrphans,
+  getCloudStorageLocation,
   getTaskProgress,
   importExistingGames,
   importGameToCloud,
+  initializeCloudDatesheets,
   migrateGameToCloud,
   rebuildArchive,
   restoreDatesheetFromBackup,
+  restoreLocalOrphan,
   updateCloudConfig
 } from './services'
 
@@ -39,6 +44,10 @@ export function setupCloudIPC(): void {
     async (_, config) => await handleCloud(() => updateCloudConfig(config))
   )
   ipcManager.handle(
+    'cloud:initialize-datesheets',
+    async (_, config) => await handleCloud(() => initializeCloudDatesheets(config))
+  )
+  ipcManager.handle(
     'cloud:get-datesheet-status',
     async () => await handleCloud(() => getCloudDatesheetStatus())
   )
@@ -51,6 +60,16 @@ export function setupCloudIPC(): void {
     async (_, role: CloudStorageRole) => await handleCloud(() => cleanupDatesheetLock(role))
   )
   ipcManager.handle('cloud:get-games', async () => await handleCloud(() => getCloudGames()))
+  ipcManager.handle('cloud:get-orphans', async () => await handleCloud(() => getCloudOrphans()))
+  ipcManager.handle('cloud:get-storage-location', async () =>
+    await handleCloud(() => getCloudStorageLocation())
+  )
+  ipcManager.handle('cloud:restore-local-orphan', async (_, gameId) =>
+    await handleCloud(() => restoreLocalOrphan(gameId))
+  )
+  ipcManager.handle('cloud:archive-local-orphan', async (_, gameId) =>
+    await handleCloud(() => archiveLocalOrphan(gameId))
+  )
   ipcManager.handle(
     'cloud:import-existing-games',
     async () => await handleCloud(() => importExistingGames())

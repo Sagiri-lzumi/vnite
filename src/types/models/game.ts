@@ -5,7 +5,11 @@ export type GameMediaType = 'cover' | 'background' | 'icon' | 'logo' | 'wideCove
 export type CloudGameStatus = 'local' | 'cloud' | 'syncing' | 'error'
 
 export type CloudTaskPhase =
+  | 'queued'
+  | 'scanning'
   | 'copying'
+  | 'verifying'
+  | 'writingDatesheet'
   | 'compressing'
   | 'deleting'
   | 'downloading'
@@ -69,6 +73,7 @@ export type CloudDatesheetReadStatus =
   | 'roleMismatch'
   | 'pairMismatch'
   | 'pathEmpty'
+  | 'operationTimeout'
   | 'lockBusy'
   | 'lockTimeout'
 
@@ -117,6 +122,32 @@ export interface CloudGameSummary {
   sizeBytes: number
   updatedAt: string
   lastError: string
+}
+
+export type CloudOrphanKind = 'localOnly' | 'cloudOnly' | 'datesheetOnly' | 'dbMissingFiles'
+
+export interface CloudOrphanSummary {
+  gameId: string
+  gameName: string
+  kind: CloudOrphanKind
+  localPath: string
+  archiveDir: string
+  sizeBytes: number
+  hasDbGame: boolean
+  hasLocalDir: boolean
+  hasCloudDir: boolean
+  hasLocalDatesheetEntry: boolean
+  hasCloudDatesheetEntry: boolean
+  canRestore: boolean
+  canArchive: boolean
+  reason: string
+}
+
+export interface CloudStorageLocationInfo {
+  configPath: string
+  databaseRoot: string
+  appRootPath: string
+  isPortableMode: boolean
 }
 
 export type gameDocs = {
